@@ -86,6 +86,7 @@ def queue_result_from_collector_row(row: dict, links: list[dict]) -> dict:
         "policy_markdown_path": row.get("policy_markdown_path"),
         "policy_html_path": row.get("policy_html_path"),
         "policy_text_path": row.get("policy_text_path"),
+        "policy_fetch_method": row.get("policy_fetch_method"),
         "policy_cluster_manifest_path": row.get("policy_cluster_manifest_path"),
         "policy_cluster_nodes_count": row.get("policy_cluster_nodes_count"),
         "policy_cluster_edges_count": row.get("policy_cluster_edges_count"),
@@ -120,6 +121,9 @@ def collect_task(task: dict, args: argparse.Namespace) -> dict:
                     return html_path.read_text(encoding="utf-8")
             return collector.request_text(url, args.timeout, args.user_agent, proxy=args.proxy)
 
+        def js_fetch(url: str) -> str:
+            return collector.render_text_with_playwright(url, args.js_timeout, args.user_agent, proxy=args.proxy)
+
         cluster_result = policy_cluster.collect_policy_cluster(
             root_url=row["policy_url"],
             output_dir=cluster_dir,
@@ -128,6 +132,8 @@ def collect_task(task: dict, args: argparse.Namespace) -> dict:
             max_docs=args.cluster_max_docs,
             min_chars=args.cluster_min_chars,
             probe_common_paths=args.cluster_probe_common_paths,
+            js_fetch_text=js_fetch if getattr(args, "js_fallback", False) else None,
+            js_fallback=getattr(args, "js_fallback", False),
         )
         row["policy_cluster_manifest_path"] = cluster_result["manifest_path"]
         row["policy_cluster_nodes_count"] = cluster_result["nodes_count"]
@@ -151,6 +157,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy", default=None)
     parser.add_argument("--no-fetch-policy", action="store_true")
     parser.add_argument("--min-policy-chars", type=int, default=1000)
+    parser.add_argument("--js-fallback", action="store_true", help="Use Playwright rendering when static pages are too short or blocked.")
+    parser.add_argument("--js-timeout", type=int, default=60)
     parser.add_argument("--try-common-paths", action="store_true")
     parser.add_argument("--enrich-lookup", action="store_true")
     parser.add_argument("--collect-cluster", action="store_true", help="Archive linked legal/privacy documents as a policy cluster.")

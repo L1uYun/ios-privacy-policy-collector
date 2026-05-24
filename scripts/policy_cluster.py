@@ -95,6 +95,7 @@ class ClusterNode:
     text_chars: int
     text_quality: str
     text_quality_reason: str | None
+    fetch_method: str
     markdown_method: str
     links_count: int
 
@@ -228,6 +229,7 @@ def archive_node(
     depth: int,
     min_chars: int,
     require_quality: bool = False,
+    fetch_method: str = "static",
 ) -> tuple[ClusterNode, list[dict]]:
     text = collector.html_to_text(html_text)
     markdown, method, links = collector.best_markdown_and_links(html_text, url)
@@ -260,6 +262,7 @@ def archive_node(
         text_chars=len(text),
         text_quality=quality,
         text_quality_reason=quality_reason,
+        fetch_method=fetch_method,
         markdown_method=method,
         links_count=len(links),
     )
@@ -275,6 +278,8 @@ def collect_policy_cluster(
     min_chars: int = 200,
     extra_allowed_hosts: set[str] | None = None,
     probe_common_paths: bool = False,
+    js_fetch_text: FetchText | None = None,
+    js_fallback: bool = False,
 ) -> dict:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -293,6 +298,16 @@ def collect_policy_cluster(
         seen.add(canonical)
         try:
             html_text = fetch_text(url)
+            fetch_method = "static"
+            text = collector.html_to_text(html_text)
+            quality, _ = collector.policy_text_quality(text, min_chars)
+            if js_fallback and js_fetch_text and quality in {"too_short", "possibly_blocked"}:
+                rendered_html = js_fetch_text(url)
+                rendered_text = collector.html_to_text(rendered_html)
+                rendered_quality, _ = collector.policy_text_quality(rendered_text, min_chars)
+                if rendered_quality == "ok" or len(rendered_text) > len(text):
+                    html_text = rendered_html
+                    fetch_method = "js"
             node, links = archive_node(
                 url,
                 html_text,
@@ -302,6 +317,7 @@ def collect_policy_cluster(
                 depth,
                 min_chars,
                 require_quality=bool(link_text and str(link_text).startswith("common-path:")),
+                fetch_method=fetch_method,
             )
         except Exception as exc:
             errors.append({"url": url, "error_class": type(exc).__name__, "error_message": str(exc), "depth": depth})
@@ -366,6 +382,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-docs", type=int, default=12)
     parser.add_argument("--min-chars", type=int, default=200)
     parser.add_argument("--probe-common-paths", action="store_true")
+    parser.add_argument("--js-fallback", action="store_true", help="Use Playwright rendering when static HTML is too short or blocked.")
+    parser.add_argument("--js-timeout", type=int, default=60)
     return parser
 
 
@@ -375,6 +393,9 @@ def main(argv: list[str] | None = None) -> int:
     def fetch(url: str) -> str:
         return collector.request_text(url, args.timeout, args.user_agent, proxy=args.proxy)
 
+    def js_fetch(url: str) -> str:
+        return collector.render_text_with_playwright(url, args.js_timeout, args.user_agent, proxy=args.proxy)
+
     result = collect_policy_cluster(
         root_url=args.url,
         output_dir=args.output_dir,
@@ -383,6 +404,8 @@ def main(argv: list[str] | None = None) -> int:
         max_docs=args.max_docs,
         min_chars=args.min_chars,
         probe_common_paths=args.probe_common_paths,
+        js_fetch_text=js_fetch if args.js_fallback else None,
+        js_fallback=args.js_fallback,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0

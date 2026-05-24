@@ -119,6 +119,7 @@ def init_db(db_path: str | Path) -> None:
                 policy_markdown_path text,
                 policy_html_path text,
                 policy_text_path text,
+                policy_fetch_method text,
                 policy_cluster_manifest_path text,
                 policy_cluster_nodes_count integer,
                 policy_cluster_edges_count integer,
@@ -159,6 +160,7 @@ def init_db(db_path: str | Path) -> None:
             "policy_cluster_nodes_count": "integer",
             "policy_cluster_edges_count": "integer",
             "policy_cluster_errors_count": "integer",
+            "policy_fetch_method": "text",
         }.items():
             existing_columns = {
                 row["name"]
@@ -298,10 +300,11 @@ def complete_fetch(db_path: str | Path, fetch_id: int, result: dict) -> None:
                 insert or replace into policy_document(
                     fetch_id, app_id, country, policy_url, canonical_policy_url,
                     policy_text_sha256, policy_text_chars, policy_markdown_path,
-                    policy_html_path, policy_text_path, policy_cluster_manifest_path,
+                    policy_html_path, policy_text_path, policy_fetch_method,
+                    policy_cluster_manifest_path,
                     policy_cluster_nodes_count, policy_cluster_edges_count,
                     policy_cluster_errors_count, created_at
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fetch_id,
@@ -314,6 +317,7 @@ def complete_fetch(db_path: str | Path, fetch_id: int, result: dict) -> None:
                     result.get("policy_markdown_path"),
                     result.get("policy_html_path"),
                     result.get("policy_text_path"),
+                    result.get("policy_fetch_method"),
                     result.get("policy_cluster_manifest_path"),
                     result.get("policy_cluster_nodes_count"),
                     result.get("policy_cluster_edges_count"),

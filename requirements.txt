@@ -2,5 +2,6 @@ beautifulsoup4>=4.12
 html2text>=2024.2.26
 lxml>=5.0
 markdownify>=0.12
+playwright>=1.44
 readability-lxml>=0.8
 trafilatura>=1.9

@@ -136,6 +136,44 @@ class PolicyClusterTests(unittest.TestCase):
                 any(error["error_class"] == "QualityError" for error in manifest["errors"])
             )
 
+    def test_collect_policy_cluster_uses_js_fallback_for_short_nodes(self):
+        static_pages = {
+            "https://example.com/privacy": "<html><body><div id='app'>Loading...</div></body></html>",
+        }
+        rendered_pages = {
+            "https://example.com/privacy": """
+                <html><body>
+                <h1>Privacy Policy</h1>
+                <p>We process personal information for account services.</p>
+                <a href="/terms">Terms of Service</a>
+                </body></html>
+            """,
+            "https://example.com/terms": """
+                <html><body>
+                <h1>Terms</h1>
+                <p>These terms govern user accounts and service access.</p>
+                </body></html>
+            """,
+        }
+        js_calls = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.cluster.collect_policy_cluster(
+                root_url="https://example.com/privacy",
+                output_dir=pathlib.Path(tmpdir),
+                fetch_text=lambda url: static_pages.get(url, "<html><body>Loading...</body></html>"),
+                js_fetch_text=lambda url: js_calls.append(url) or rendered_pages[url],
+                max_depth=1,
+                max_docs=5,
+                min_chars=20,
+                js_fallback=True,
+            )
+            manifest = json.loads(pathlib.Path(result["manifest_path"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(js_calls, ["https://example.com/privacy", "https://example.com/terms"])
+            self.assertEqual(len(manifest["nodes"]), 2)
+            self.assertTrue(all(node["fetch_method"] == "js" for node in manifest["nodes"]))
+
 
 if __name__ == "__main__":
     unittest.main()

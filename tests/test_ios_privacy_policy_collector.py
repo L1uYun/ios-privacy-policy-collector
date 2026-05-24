@@ -1,7 +1,9 @@
 import importlib.util
+import argparse
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
 
 
@@ -228,6 +230,63 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
 
         self.assertEqual(quality, "ok")
         self.assertIsNone(reason)
+
+    def test_fetch_policy_candidate_can_fallback_to_js_rendering_for_short_static_html(self):
+        record = self.collector.AppRecord(
+            app_id="1234567890",
+            name="Example App",
+            bundle_id=None,
+            seller_name="Example Inc.",
+            app_store_url="https://apps.apple.com/us/app/example/id1234567890",
+            seller_url="https://example.com",
+            source="test",
+            raw={},
+        )
+        static_html = "<html><body><div id='app'>Loading...</div><script src='app.js'></script></body></html>"
+        rendered_html = """
+            <html><body>
+            <h1>Privacy Policy</h1>
+            <p>We process personal information to provide account services.</p>
+            <a href="/terms">Terms of Service</a>
+            </body></html>
+        """
+        calls = []
+
+        def fake_request_text(url, timeout, user_agent, proxy=None):
+            return static_html
+
+        def fake_render(url, timeout, user_agent, proxy=None):
+            calls.append(url)
+            return rendered_html
+
+        original_request_text = self.collector.request_text
+        try:
+            self.collector.request_text = fake_request_text
+            with tempfile.TemporaryDirectory() as tmpdir:
+                args = argparse.Namespace(
+                    timeout=10,
+                    user_agent="test-agent",
+                    proxy=None,
+                    min_policy_chars=50,
+                    js_fallback=True,
+                    js_timeout=15,
+                    render_text=fake_render,
+                )
+                row = self.collector.fetch_policy_candidate(
+                    "https://example.com/privacy",
+                    record,
+                    args,
+                    pathlib.Path(tmpdir),
+                    "",
+                )
+                markdown = pathlib.Path(row["policy_markdown_path"]).read_text(encoding="utf-8")
+        finally:
+            self.collector.request_text = original_request_text
+
+        self.assertEqual(calls, ["https://example.com/privacy"])
+        self.assertEqual(row["policy_text_quality"], "ok")
+        self.assertEqual(row["policy_fetch_method"], "js")
+        self.assertIn("Terms of Service", markdown)
 
     def test_builds_records_from_offline_lookup_result(self):
         lookup_payload = {

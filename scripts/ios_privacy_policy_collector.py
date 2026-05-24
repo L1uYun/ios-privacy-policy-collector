@@ -254,6 +254,26 @@ def request_text(url: str, timeout: int, user_agent: str, proxy: str | None = No
         return response.read().decode(content_type, "replace")
 
 
+def render_text_with_playwright(url: str, timeout: int, user_agent: str, proxy: str | None = None) -> str:
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("Playwright is not installed. Run: python -m pip install playwright && python -m playwright install chromium") from exc
+
+    launch_options: dict = {"headless": True}
+    if proxy:
+        launch_options["proxy"] = {"server": proxy}
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(**launch_options)
+        try:
+            context = browser.new_context(user_agent=user_agent)
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            return page.content()
+        finally:
+            browser.close()
+
+
 def itunes_lookup_url(app_id: str | None = None, bundle_id: str | None = None, country: str = "us") -> str:
     params: dict[str, str] = {"country": country, "entity": "software"}
     if app_id:
@@ -744,9 +764,27 @@ def fetch_policy_candidate(
     suffix: str,
 ) -> dict:
     policy_html = request_text(policy_url, args.timeout, args.user_agent, proxy=args.proxy)
+    fetch_method = "static"
     policy_text = html_to_text(policy_html)
     policy_markdown, markdown_method, policy_links = best_markdown_and_links(policy_html, policy_url)
     quality, quality_reason = policy_text_quality(policy_text, args.min_policy_chars)
+    if getattr(args, "js_fallback", False) and quality in {"too_short", "possibly_blocked"}:
+        render_text = getattr(args, "render_text", render_text_with_playwright)
+        rendered_html = render_text(
+            policy_url,
+            getattr(args, "js_timeout", args.timeout),
+            args.user_agent,
+            proxy=args.proxy,
+        )
+        rendered_text = html_to_text(rendered_html)
+        rendered_quality, rendered_quality_reason = policy_text_quality(rendered_text, args.min_policy_chars)
+        if rendered_quality == "ok" or len(rendered_text) > len(policy_text):
+            policy_html = rendered_html
+            policy_text = rendered_text
+            policy_markdown, markdown_method, policy_links = best_markdown_and_links(policy_html, policy_url)
+            quality = rendered_quality
+            quality_reason = rendered_quality_reason
+            fetch_method = "js"
 
     policy_html_path = app_dir / f"privacy-policy{suffix}.html"
     policy_text_path = app_dir / f"privacy-policy{suffix}.txt"
@@ -767,6 +805,7 @@ def fetch_policy_candidate(
         "policy_text_path": str(policy_text_path),
         "policy_markdown_path": str(policy_markdown_path),
         "policy_links_path": str(policy_links_path),
+        "policy_fetch_method": fetch_method,
         "policy_markdown_method": markdown_method,
         "policy_text_sha256": sha256_text(policy_text),
         "policy_text_chars": len(policy_text),
@@ -913,6 +952,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy", default=os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY"), help="Optional HTTP(S) proxy URL, for example http://127.0.0.1:7890.")
     parser.add_argument("--no-fetch-policy", action="store_true", help="Only discover policy URLs; do not fetch policy pages.")
     parser.add_argument("--min-policy-chars", type=int, default=1000, help="Minimum extracted text length to count as a full policy candidate.")
+    parser.add_argument("--js-fallback", action="store_true", help="Use Playwright rendering when static policy HTML is too short or blocked.")
+    parser.add_argument("--js-timeout", type=int, default=60, help="Playwright rendering timeout in seconds.")
     parser.add_argument("--try-common-paths", action="store_true", help="If the explicit policy URL is missing or too short, try common privacy paths on seller/app origins.")
     parser.add_argument("--enrich-lookup", action="store_true", help="For chart seeds, call iTunes lookup per app to add sellerUrl and bundleId before fetching policies.")
     parser.add_argument("--resume", action="store_true", help="Skip country/app pairs already completed in the JSONL output.")

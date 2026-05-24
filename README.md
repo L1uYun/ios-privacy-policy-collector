@@ -36,10 +36,12 @@ Python 3.11+ is recommended.
 
 ```bash
 python -m pip install -r requirements.txt
+python -m playwright install chromium
 ```
 
 The script still runs with the Python standard library only, but installs better
-HTML-to-Markdown extraction when these optional packages are present.
+HTML-to-Markdown extraction when these optional packages are present. Playwright
+is only needed when using `--js-fallback`.
 
 ## Quick Start
 
@@ -140,6 +142,7 @@ python scripts/queue_worker.py \
   --proxy http://127.0.0.1:7890 \
   --try-common-paths \
   --enrich-lookup \
+  --js-fallback \
   --collect-cluster \
   --cluster-probe-common-paths
 ```
@@ -160,7 +163,8 @@ python scripts/policy_cluster.py \
   --output-dir F:\ios-privacy-policy-collector\data\smoke\doubao-policy-cluster \
   --proxy http://127.0.0.1:7890 \
   --max-depth 1 \
-  --max-docs 12
+  --max-docs 12 \
+  --js-fallback
 ```
 
 For higher recall, add common same-domain path probing:
@@ -172,7 +176,8 @@ python scripts/policy_cluster.py \
   --proxy http://127.0.0.1:7890 \
   --max-depth 1 \
   --max-docs 30 \
-  --probe-common-paths
+  --probe-common-paths \
+  --js-fallback
 ```
 
 Common-path probing tries routes such as `/terms`, `/legal/terms`,
@@ -181,6 +186,10 @@ Short shell pages and failed probes are recorded as manifest errors rather than
 accepted as cluster nodes. Explicit links found inside the root policy are kept
 as evidence even when their quality flag is weak, because they were referenced
 by the policy itself.
+
+With `--js-fallback`, static HTTP is still tried first. If extracted text is too
+short or appears blocked, Chromium renders the page and the rendered HTML is
+archived instead when it improves the extracted policy text.
 
 ## Inputs
 
