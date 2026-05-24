@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Run one or more SQLite queue tasks using the iOS policy collector."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import sys
+import uuid
+from pathlib import Path
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def load_script_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+queue_store = load_script_module("queue_store", SCRIPT_DIR / "queue_store.py")
+collector = load_script_module(
+    "ios_privacy_policy_collector",
+    SCRIPT_DIR / "ios_privacy_policy_collector.py",
+)
+
+
+def links_from_jsonl_text(text: str) -> list[dict]:
+    links = []
+    for line in text.splitlines():
+        if line.strip():
+            links.append(json.loads(line))
+    return links
+
+
+def load_links(path: str | None) -> list[dict]:
+    if not path:
+        return []
+    link_path = Path(path)
+    if not link_path.exists():
+        return []
+    return links_from_jsonl_text(link_path.read_text(encoding="utf-8"))
+
+
+def retryable_error(message: str | None) -> bool:
+    if not message:
+        return False
+    lower = message.lower()
+    retryable_markers = [
+        "timeout",
+        "temporarily",
+        "connection",
+        "http error 403",
+        "http error 406",
+        "http error 429",
+        "http error 500",
+        "http error 502",
+        "http error 503",
+        "http error 504",
+        "ssl",
+    ]
+    permanent_markers = [
+        "privacy policy url not found",
+        "policy text not complete enough",
+        "not found on app store page",
+    ]
+    if any(marker in lower for marker in permanent_markers):
+        return False
+    return any(marker in lower for marker in retryable_markers)
+
+
+def queue_result_from_collector_row(row: dict, links: list[dict]) -> dict:
+    return {
+        "status": "ok",
+        "policy_url": row["policy_url"],
+        "canonical_policy_url": row.get("policy_url"),
+        "policy_url_method": row.get("policy_url_method"),
+        "policy_url_evidence": row.get("policy_url_evidence"),
+        "policy_text_sha256": row.get("policy_text_sha256"),
+        "policy_text_chars": row.get("policy_text_chars"),
+        "policy_markdown_path": row.get("policy_markdown_path"),
+        "policy_html_path": row.get("policy_html_path"),
+        "policy_text_path": row.get("policy_text_path"),
+        "policy_links": links,
+    }
+
+
+def collect_task(task: dict, args: argparse.Namespace) -> dict:
+    record = collector.AppRecord(
+        app_id=str(task["app_id"]),
+        name=None,
+        bundle_id=task.get("bundle_id"),
+        seller_name=None,
+        app_store_url=task.get("app_store_url"),
+        seller_url=None,
+        source=task.get("seed_source") or "queue",
+        raw={},
+    )
+    if args.enrich_lookup:
+        record = collector.enrich_record_from_lookup(record, task["country"], args)
+    row = collector.collect_app(record, args, country=task["country"])
+    if row.get("error") or row.get("policy_text_quality") != "ok":
+        raise RuntimeError(row.get("error") or row.get("policy_text_quality") or "collector failed")
+    return queue_result_from_collector_row(row, load_links(row.get("policy_links_path")))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run queued policy collection tasks.")
+    parser.add_argument("--db", default=str(queue_store.default_db_path()))
+    parser.add_argument("--worker-id", default=f"worker-{uuid.uuid4().hex[:8]}")
+    parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--output-dir", default=str(queue_store.default_data_root() / "out"))
+    parser.add_argument("--jsonl", default=str(queue_store.default_data_root() / "worker-results.jsonl"))
+    parser.add_argument("--timeout", type=int, default=45)
+    parser.add_argument("--fallback-timeout", type=int, default=8)
+    parser.add_argument("--sleep", type=float, default=0.0)
+    parser.add_argument("--user-agent", default=collector.DEFAULT_USER_AGENT)
+    parser.add_argument("--proxy", default=None)
+    parser.add_argument("--no-fetch-policy", action="store_true")
+    parser.add_argument("--min-policy-chars", type=int, default=1000)
+    parser.add_argument("--try-common-paths", action="store_true")
+    parser.add_argument("--enrich-lookup", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    queue_store.init_db(args.db)
+    processed = 0
+    while processed < args.limit:
+        task = queue_store.claim_next_fetch(args.db, args.worker_id)
+        if task is None:
+            break
+        try:
+            result = collect_task(task, args)
+        except Exception as exc:
+            queue_store.fail_fetch(
+                args.db,
+                task["fetch_id"],
+                type(exc).__name__,
+                str(exc),
+                retryable=retryable_error(str(exc)),
+                max_attempts=args.max_attempts,
+            )
+            print(json.dumps({"fetch_id": task["fetch_id"], "status": "failed", "error": str(exc)}, sort_keys=True))
+        else:
+            queue_store.complete_fetch(args.db, task["fetch_id"], result)
+            print(json.dumps({"fetch_id": task["fetch_id"], "status": "ok"}, sort_keys=True))
+        processed += 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

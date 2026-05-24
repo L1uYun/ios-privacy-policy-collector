@@ -71,6 +71,71 @@ python scripts/ios_privacy_policy_collector.py \
   --jsonl out/ios-chart/results.jsonl
 ```
 
+## Queue Database
+
+For large runs, keep runtime data outside the repository. On the Windows machine
+used for development, the recommended data root is:
+
+```text
+F:\ios-privacy-policy-collector\data
+```
+
+Initialize a queue database:
+
+```bash
+python scripts/queue_store.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  init
+```
+
+Import seeds from CSV or JSONL:
+
+```bash
+python scripts/queue_store.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  import-seeds \
+  --file seeds.csv \
+  --source public-dataset \
+  --country us
+```
+
+Seed CSV files can include:
+
+```text
+app_id,bundle_id,app_store_url,country,provenance_url,license_note
+```
+
+Check queue statistics:
+
+```bash
+python scripts/queue_store.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  stats
+```
+
+Claim one pending fetch task for a worker:
+
+```bash
+python scripts/queue_store.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  claim \
+  --worker-id worker-1
+```
+
+Run queued collection tasks:
+
+```bash
+python scripts/queue_worker.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  --worker-id worker-1 \
+  --limit 10 \
+  --output-dir F:\ios-privacy-policy-collector\data\out \
+  --jsonl F:\ios-privacy-policy-collector\data\worker-results.jsonl \
+  --proxy http://127.0.0.1:7890 \
+  --try-common-paths \
+  --enrich-lookup
+```
+
 ## Inputs
 
 - `--app-id`: App Store numeric ID, `id...` value, or full App Store URL.

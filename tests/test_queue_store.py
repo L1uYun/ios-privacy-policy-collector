@@ -1,0 +1,172 @@
+import importlib.util
+import pathlib
+import sqlite3
+import sys
+import tempfile
+import unittest
+from contextlib import closing
+
+
+SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "queue_store.py"
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location("queue_store", SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class QueueStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.queue = load_module()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = pathlib.Path(self.tmp.name) / "queue.sqlite"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_init_db_creates_expected_tables(self):
+        self.queue.init_db(self.db_path)
+
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "select name from sqlite_master where type = 'table'"
+                )
+            }
+
+        self.assertTrue(
+            {
+                "app_seed",
+                "app_metadata",
+                "policy_url_candidate",
+                "policy_fetch",
+                "policy_document",
+                "policy_link",
+                "run_event",
+            }.issubset(tables)
+        )
+
+    def test_import_seeds_deduplicates_by_source_country_and_app(self):
+        self.queue.init_db(self.db_path)
+        rows = [
+            {
+                "seed_source": "fixture",
+                "app_id": "123",
+                "bundle_id": "com.example.app",
+                "app_store_url": "https://apps.apple.com/us/app/example/id123",
+                "country": "us",
+                "provenance_url": "file://fixture",
+                "license_note": "test",
+            },
+            {
+                "seed_source": "fixture",
+                "app_id": "123",
+                "bundle_id": "com.example.app",
+                "app_store_url": "https://apps.apple.com/us/app/example/id123",
+                "country": "us",
+                "provenance_url": "file://fixture",
+                "license_note": "test",
+            },
+            {
+                "seed_source": "fixture",
+                "app_id": "123",
+                "country": "gb",
+            },
+        ]
+
+        result = self.queue.import_seeds(self.db_path, rows)
+        stats = self.queue.stats(self.db_path)
+
+        self.assertEqual(result["inserted"], 2)
+        self.assertEqual(result["duplicates"], 1)
+        self.assertEqual(stats["seed_rows"], 2)
+        self.assertEqual(stats["pending_fetches"], 2)
+
+    def test_claim_next_fetch_marks_rows_running(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [
+                {"seed_source": "fixture", "app_id": "123", "country": "us"},
+                {"seed_source": "fixture", "app_id": "456", "country": "us"},
+            ],
+        )
+
+        first = self.queue.claim_next_fetch(self.db_path, worker_id="w1")
+        second = self.queue.claim_next_fetch(self.db_path, worker_id="w1")
+        none_left = self.queue.claim_next_fetch(self.db_path, worker_id="w2")
+        stats = self.queue.stats(self.db_path)
+
+        self.assertEqual(first["app_id"], "123")
+        self.assertEqual(second["app_id"], "456")
+        self.assertIsNone(none_left)
+        self.assertEqual(stats["running_fetches"], 2)
+
+    def test_complete_fetch_records_policy_document_and_links(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [{"seed_source": "fixture", "app_id": "123", "country": "us"}],
+        )
+        task = self.queue.claim_next_fetch(self.db_path, worker_id="w1")
+
+        self.queue.complete_fetch(
+            self.db_path,
+            fetch_id=task["fetch_id"],
+            result={
+                "status": "ok",
+                "policy_url": "https://example.com/privacy",
+                "canonical_policy_url": "https://example.com/privacy",
+                "policy_text_sha256": "abc123",
+                "policy_text_chars": 1200,
+                "policy_markdown_path": "out/us/123/privacy-policy.md",
+                "policy_html_path": "out/us/123/privacy-policy.html",
+                "policy_text_path": "out/us/123/privacy-policy.txt",
+                "policy_links": [
+                    {"text": "Contact", "url": "https://example.com/contact"}
+                ],
+            },
+        )
+        stats = self.queue.stats(self.db_path)
+
+        self.assertEqual(stats["ok_fetches"], 1)
+        self.assertEqual(stats["policy_documents"], 1)
+        self.assertEqual(stats["policy_links"], 1)
+
+    def test_fail_fetch_can_retry_then_become_permanent(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [{"seed_source": "fixture", "app_id": "123", "country": "us"}],
+        )
+        task = self.queue.claim_next_fetch(self.db_path, worker_id="w1")
+
+        self.queue.fail_fetch(
+            self.db_path,
+            fetch_id=task["fetch_id"],
+            error_class="HTTPError",
+            error_message="403",
+            retryable=True,
+            max_attempts=2,
+        )
+        retried = self.queue.claim_next_fetch(self.db_path, worker_id="w2")
+        self.queue.fail_fetch(
+            self.db_path,
+            fetch_id=retried["fetch_id"],
+            error_class="HTTPError",
+            error_message="403",
+            retryable=True,
+            max_attempts=2,
+        )
+        stats = self.queue.stats(self.db_path)
+
+        self.assertEqual(stats["permanent_error_fetches"], 1)
+        self.assertEqual(stats["pending_fetches"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
