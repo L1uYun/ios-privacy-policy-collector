@@ -254,7 +254,13 @@ def request_text(url: str, timeout: int, user_agent: str, proxy: str | None = No
         return response.read().decode(content_type, "replace")
 
 
-def render_text_with_playwright(url: str, timeout: int, user_agent: str, proxy: str | None = None) -> str:
+def render_text_with_playwright(
+    url: str,
+    timeout: int,
+    user_agent: str,
+    proxy: str | None = None,
+    wait_ms: int = 2000,
+) -> str:
     try:
         from playwright.sync_api import sync_playwright  # type: ignore
     except ImportError as exc:
@@ -268,7 +274,9 @@ def render_text_with_playwright(url: str, timeout: int, user_agent: str, proxy: 
         try:
             context = browser.new_context(user_agent=user_agent)
             page = context.new_page()
-            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            if wait_ms > 0:
+                page.wait_for_timeout(wait_ms)
             return page.content()
         finally:
             browser.close()
@@ -775,6 +783,7 @@ def fetch_policy_candidate(
             getattr(args, "js_timeout", args.timeout),
             args.user_agent,
             proxy=args.proxy,
+            wait_ms=getattr(args, "js_wait_ms", 2000),
         )
         rendered_text = html_to_text(rendered_html)
         rendered_quality, rendered_quality_reason = policy_text_quality(rendered_text, args.min_policy_chars)
@@ -954,6 +963,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-policy-chars", type=int, default=1000, help="Minimum extracted text length to count as a full policy candidate.")
     parser.add_argument("--js-fallback", action="store_true", help="Use Playwright rendering when static policy HTML is too short or blocked.")
     parser.add_argument("--js-timeout", type=int, default=60, help="Playwright rendering timeout in seconds.")
+    parser.add_argument("--js-wait-ms", type=int, default=2000, help="Extra wait after DOMContentLoaded before saving rendered HTML.")
     parser.add_argument("--try-common-paths", action="store_true", help="If the explicit policy URL is missing or too short, try common privacy paths on seller/app origins.")
     parser.add_argument("--enrich-lookup", action="store_true", help="For chart seeds, call iTunes lookup per app to add sellerUrl and bundleId before fetching policies.")
     parser.add_argument("--resume", action="store_true", help="Skip country/app pairs already completed in the JSONL output.")

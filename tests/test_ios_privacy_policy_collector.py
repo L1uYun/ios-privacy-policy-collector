@@ -255,7 +255,7 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         def fake_request_text(url, timeout, user_agent, proxy=None):
             return static_html
 
-        def fake_render(url, timeout, user_agent, proxy=None):
+        def fake_render(url, timeout, user_agent, proxy=None, wait_ms=0):
             calls.append(url)
             return rendered_html
 
@@ -270,6 +270,7 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
                     min_policy_chars=50,
                     js_fallback=True,
                     js_timeout=15,
+                    js_wait_ms=100,
                     render_text=fake_render,
                 )
                 row = self.collector.fetch_policy_candidate(

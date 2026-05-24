@@ -384,6 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-common-paths", action="store_true")
     parser.add_argument("--js-fallback", action="store_true", help="Use Playwright rendering when static HTML is too short or blocked.")
     parser.add_argument("--js-timeout", type=int, default=60)
+    parser.add_argument("--js-wait-ms", type=int, default=2000)
     return parser
 
 
@@ -394,7 +395,13 @@ def main(argv: list[str] | None = None) -> int:
         return collector.request_text(url, args.timeout, args.user_agent, proxy=args.proxy)
 
     def js_fetch(url: str) -> str:
-        return collector.render_text_with_playwright(url, args.js_timeout, args.user_agent, proxy=args.proxy)
+        return collector.render_text_with_playwright(
+            url,
+            args.js_timeout,
+            args.user_agent,
+            proxy=args.proxy,
+            wait_ms=args.js_wait_ms,
+        )
 
     result = collect_policy_cluster(
         root_url=args.url,
