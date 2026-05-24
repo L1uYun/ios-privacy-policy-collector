@@ -274,6 +274,26 @@ def render_text_with_playwright(
         try:
             context = browser.new_context(user_agent=user_agent)
             page = context.new_page()
+            blocked_resource_types = {"image", "media", "font"}
+            blocked_url_fragments = [
+                "doubleclick",
+                "googletagmanager",
+                "google-analytics",
+                "facebook.net",
+                "analytics",
+                "adsystem",
+                "/ads/",
+            ]
+
+            def route_request(route):
+                request = route.request
+                lower_url = request.url.lower()
+                if request.resource_type in blocked_resource_types or any(fragment in lower_url for fragment in blocked_url_fragments):
+                    route.abort()
+                else:
+                    route.continue_()
+
+            page.route("**/*", route_request)
             page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             if wait_ms > 0:
                 page.wait_for_timeout(wait_ms)
@@ -576,11 +596,27 @@ def common_privacy_url_candidates(base_url: str) -> list[str]:
         "/legal/privacy",
         "/legal/privacy-policy",
         "/policies/privacy",
+        "/policies/privacy-policy",
         "/policy/privacy",
+        "/privacy/notice",
+        "/privacy-notice",
+        "/privacy-center",
+        "/privacy/security",
+        "/legal",
+        "/legal/privacy-notice",
+        "/legal/privacy-center",
         "/privacy.html",
         "/privacy-policy.html",
         "/en/privacy",
         "/en/privacy-policy",
+        "/terms",
+        "/terms-of-service",
+        "/terms-of-use",
+        "/legal/terms",
+        "/legal/terms-of-service",
+        "/legal/terms-of-use",
+        "/policies/terms",
+        "/policies/terms-of-service",
     ]
     return [origin + path for path in paths]
 
@@ -771,6 +807,19 @@ def fetch_policy_candidate(
     app_dir: Path,
     suffix: str,
 ) -> dict:
+    attempt = {
+        "policy_url": policy_url,
+        "canonical_policy_url": policy_url,
+        "attempt_index": None,
+        "source": "primary" if not suffix else "fallback",
+        "status": "started",
+        "fetch_method": "static",
+        "text_chars": 0,
+        "quality": None,
+        "quality_reason": None,
+        "error_class": None,
+        "error_message": None,
+    }
     policy_html = request_text(policy_url, args.timeout, args.user_agent, proxy=args.proxy)
     fetch_method = "static"
     policy_text = html_to_text(policy_html)
@@ -794,6 +843,15 @@ def fetch_policy_candidate(
             quality = rendered_quality
             quality_reason = rendered_quality_reason
             fetch_method = "js"
+    attempt.update(
+        {
+            "status": "accepted" if quality == "ok" else "rejected",
+            "fetch_method": fetch_method,
+            "text_chars": len(policy_text),
+            "quality": quality,
+            "quality_reason": quality_reason,
+        }
+    )
 
     policy_html_path = app_dir / f"privacy-policy{suffix}.html"
     policy_text_path = app_dir / f"privacy-policy{suffix}.txt"
@@ -821,6 +879,7 @@ def fetch_policy_candidate(
         "policy_text_quality": quality,
         "policy_text_quality_reason": quality_reason,
         "policy_links_count": len(policy_links),
+        "policy_url_attempt": attempt,
     }
 
 
@@ -867,6 +926,7 @@ def collect_app(record: AppRecord, args: argparse.Namespace, country: str) -> di
         "policy_text_quality": None,
         "policy_text_quality_reason": None,
         "candidate_errors": [],
+        "policy_url_attempts": [],
         "error": None,
     }
 
@@ -913,12 +973,31 @@ def collect_app(record: AppRecord, args: argparse.Namespace, country: str) -> di
                 if index > 0:
                     args.timeout = args.fallback_timeout
                 candidate_row = fetch_policy_candidate(candidate_url, record, args, app_dir, suffix)
-            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, UnicodeError) as exc:
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, UnicodeError, RuntimeError) as exc:
                 candidate_errors.append(f"{candidate_url}: {type(exc).__name__}: {exc}")
+                row["policy_url_attempts"].append(
+                    {
+                        "policy_url": candidate_url,
+                        "canonical_policy_url": candidate_url,
+                        "attempt_index": index,
+                        "source": "primary" if index == 0 else "fallback",
+                        "status": "error",
+                        "fetch_method": "js" if getattr(args, "js_fallback", False) else "static",
+                        "text_chars": 0,
+                        "quality": None,
+                        "quality_reason": None,
+                        "error_class": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                )
                 continue
             finally:
                 if index > 0:
                     args.timeout = previous_timeout
+            attempt = candidate_row.pop("policy_url_attempt", None)
+            if attempt:
+                attempt["attempt_index"] = index
+                row["policy_url_attempts"].append(attempt)
             row.update(candidate_row)
             if candidate_row["policy_text_quality"] == "ok":
                 break

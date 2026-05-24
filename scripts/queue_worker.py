@@ -92,6 +92,7 @@ def queue_result_from_collector_row(row: dict, links: list[dict]) -> dict:
         "policy_cluster_edges_count": row.get("policy_cluster_edges_count"),
         "policy_cluster_errors_count": row.get("policy_cluster_errors_count"),
         "policy_links": links,
+        "policy_url_attempts": row.get("policy_url_attempts") or [],
     }
 
 
@@ -110,7 +111,9 @@ def collect_task(task: dict, args: argparse.Namespace) -> dict:
         record = collector.enrich_record_from_lookup(record, task["country"], args)
     row = collector.collect_app(record, args, country=task["country"])
     if row.get("error") or row.get("policy_text_quality") != "ok":
-        raise RuntimeError(row.get("error") or row.get("policy_text_quality") or "collector failed")
+        exc = RuntimeError(row.get("error") or row.get("policy_text_quality") or "collector failed")
+        setattr(exc, "policy_url_attempts", row.get("policy_url_attempts") or [])
+        raise exc
     if args.collect_cluster:
         cluster_dir = Path(row["policy_markdown_path"]).parent / "policy-cluster"
 
@@ -194,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                 str(exc),
                 retryable=retryable_error(str(exc)),
                 max_attempts=args.max_attempts,
+                policy_url_attempts=getattr(exc, "policy_url_attempts", []),
             )
             print(json.dumps({"fetch_id": task["fetch_id"], "status": "failed", "error": str(exc)}, sort_keys=True))
         else:

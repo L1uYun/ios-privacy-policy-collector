@@ -147,6 +147,25 @@ python scripts/queue_worker.py \
   --cluster-probe-common-paths
 ```
 
+For larger batches, use the multi-worker runner. It keeps worker JSONL logs
+separate, writes a live summary JSON, and uses bounded JS rendering defaults so
+one slow site does not stall the whole run:
+
+```bash
+python scripts/run_batch.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  --output-dir F:\ios-privacy-policy-collector\data\out \
+  --log-dir F:\ios-privacy-policy-collector\data\logs \
+  --workers 8 \
+  --limit-per-worker 1000 \
+  --proxy http://127.0.0.1:7890
+```
+
+For million-scale collection, run repeated batches against the same queue until
+`pending_fetches` reaches zero. Keep `policy_url_attempt` rows: they record each
+candidate URL, fetch method, extracted length, quality flag, and error, which is
+the audit trail needed to repair failures without re-running successful apps.
+
 ## Policy Cluster Mode
 
 The collector can archive more than the privacy-policy entry page. Policy
@@ -213,6 +232,9 @@ This is not a full million-app crawler by itself. For large runs:
   pages.
 - Use policy cluster mode for high-quality runs so privacy policies, user
   agreements, cookie/data notices, and linked legal documents stay connected.
+- Keep `policy_url_attempt` logs for every candidate URL so failed app rows can
+  be repaired by URL-discovery rules instead of being guessed from coarse
+  worker errors.
 - Apply per-domain rate limits and keep failure reasons auditable.
 
 ## Roadmap For 1M App Store Apps
@@ -272,6 +294,7 @@ Recommended tables:
 - `app_seed`
 - `app_metadata`
 - `policy_url_candidate`
+- `policy_url_attempt`
 - `policy_fetch`
 - `policy_document`
 - `policy_link`

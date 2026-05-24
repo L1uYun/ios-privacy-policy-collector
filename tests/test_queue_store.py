@@ -133,6 +133,32 @@ class QueueStoreTests(unittest.TestCase):
                 "policy_links": [
                     {"text": "Contact", "url": "https://example.com/contact"}
                 ],
+                "policy_url_attempts": [
+                    {
+                        "policy_url": "https://example.com/loading",
+                        "canonical_policy_url": "https://example.com/loading",
+                        "attempt_index": 0,
+                        "status": "rejected",
+                        "fetch_method": "js",
+                        "text_chars": 12,
+                        "quality": "too_short",
+                        "quality_reason": "below threshold",
+                        "error_class": None,
+                        "error_message": None,
+                    },
+                    {
+                        "policy_url": "https://example.com/privacy",
+                        "canonical_policy_url": "https://example.com/privacy",
+                        "attempt_index": 1,
+                        "status": "accepted",
+                        "fetch_method": "static",
+                        "text_chars": 1200,
+                        "quality": "ok",
+                        "quality_reason": None,
+                        "error_class": None,
+                        "error_message": None,
+                    },
+                ],
             },
         )
         stats = self.queue.stats(self.db_path)
@@ -140,13 +166,56 @@ class QueueStoreTests(unittest.TestCase):
         self.assertEqual(stats["ok_fetches"], 1)
         self.assertEqual(stats["policy_documents"], 1)
         self.assertEqual(stats["policy_links"], 1)
+        self.assertEqual(stats["policy_url_attempts"], 2)
         with closing(self.queue.connect(self.db_path)) as conn:
             row = conn.execute(
                 "select policy_fetch_method, policy_cluster_manifest_path, policy_cluster_nodes_count from policy_document"
             ).fetchone()
+            attempts = conn.execute(
+                "select status, fetch_method, text_chars, quality from policy_url_attempt order by attempt_index"
+            ).fetchall()
         self.assertEqual(row["policy_fetch_method"], "js")
         self.assertEqual(row["policy_cluster_manifest_path"], "out/us/123/policy-cluster/cluster.json")
         self.assertEqual(row["policy_cluster_nodes_count"], 3)
+        self.assertEqual([attempt["status"] for attempt in attempts], ["rejected", "accepted"])
+        self.assertEqual(attempts[0]["fetch_method"], "js")
+
+    def test_fail_fetch_records_policy_url_attempts(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [{"seed_source": "fixture", "app_id": "123", "country": "us"}],
+        )
+        task = self.queue.claim_next_fetch(self.db_path, worker_id="w1")
+
+        self.queue.fail_fetch(
+            self.db_path,
+            fetch_id=task["fetch_id"],
+            error_class="RuntimeError",
+            error_message="policy text not complete enough",
+            retryable=False,
+            max_attempts=1,
+            policy_url_attempts=[
+                {
+                    "policy_url": "https://example.com/privacy",
+                    "attempt_index": 0,
+                    "status": "error",
+                    "fetch_method": "static",
+                    "text_chars": 0,
+                    "quality": None,
+                    "quality_reason": None,
+                    "error_class": "HTTPError",
+                    "error_message": "404",
+                }
+            ],
+        )
+
+        with closing(self.queue.connect(self.db_path)) as conn:
+            attempt = conn.execute(
+                "select status, error_class, error_message from policy_url_attempt"
+            ).fetchone()
+        self.assertEqual(attempt["status"], "error")
+        self.assertEqual(attempt["error_class"], "HTTPError")
 
     def test_fail_fetch_can_retry_then_become_permanent(self):
         self.queue.init_db(self.db_path)

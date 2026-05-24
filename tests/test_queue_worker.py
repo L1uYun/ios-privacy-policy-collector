@@ -36,6 +36,7 @@ class QueueWorkerTests(unittest.TestCase):
             "policy_cluster_manifest_path": "out/us/123/policy-cluster/cluster.json",
             "policy_cluster_nodes_count": 3,
             "policy_cluster_edges_count": 2,
+            "policy_url_attempts": [{"policy_url": "https://example.com/privacy", "status": "accepted"}],
         }
         links = [{"text": "Contact", "url": "https://example.com/contact"}]
 
@@ -47,6 +48,7 @@ class QueueWorkerTests(unittest.TestCase):
         self.assertEqual(result["policy_links"], links)
         self.assertEqual(result["policy_cluster_manifest_path"], "out/us/123/policy-cluster/cluster.json")
         self.assertEqual(result["policy_cluster_nodes_count"], 3)
+        self.assertEqual(result["policy_url_attempts"][0]["status"], "accepted")
 
     def test_retryable_error_classifies_transient_failures(self):
         self.assertTrue(self.worker.retryable_error("HTTP Error 403: Forbidden"))

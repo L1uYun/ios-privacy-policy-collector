@@ -135,6 +135,26 @@ def init_db(db_path: str | Path) -> None:
                 url text not null
             );
 
+            create table if not exists policy_url_attempt (
+                attempt_id integer primary key,
+                fetch_id integer not null references policy_fetch(fetch_id) on delete cascade,
+                app_id text not null,
+                country text not null,
+                attempt_index integer not null,
+                policy_url text not null,
+                canonical_policy_url text,
+                source text,
+                status text not null,
+                fetch_method text,
+                text_chars integer,
+                quality text,
+                quality_reason text,
+                error_class text,
+                error_message text,
+                created_at text not null,
+                unique(fetch_id, attempt_index, policy_url)
+            );
+
             create table if not exists run_event (
                 event_id integer primary key,
                 event_type text not null,
@@ -149,6 +169,8 @@ def init_db(db_path: str | Path) -> None:
                 on policy_document(policy_text_sha256);
             create index if not exists idx_policy_url_candidate_url
                 on policy_url_candidate(canonical_policy_url);
+            create index if not exists idx_policy_url_attempt_fetch
+                on policy_url_attempt(fetch_id, attempt_index);
             """
         )
         conn.execute(
@@ -169,6 +191,46 @@ def init_db(db_path: str | Path) -> None:
             if column_name not in existing_columns:
                 conn.execute(f"alter table policy_document add column {column_name} {column_type}")
         conn.commit()
+
+
+def save_policy_url_attempts(conn: sqlite3.Connection, fetch_id: int, attempts: Iterable[dict], now: str) -> None:
+    fetch = conn.execute(
+        "select app_id, country from policy_fetch where fetch_id = ?",
+        (fetch_id,),
+    ).fetchone()
+    if fetch is None:
+        raise ValueError(f"unknown fetch_id: {fetch_id}")
+    conn.execute("delete from policy_url_attempt where fetch_id = ?", (fetch_id,))
+    for index, attempt in enumerate(attempts):
+        policy_url = attempt.get("policy_url")
+        if not policy_url:
+            continue
+        conn.execute(
+            """
+            insert or replace into policy_url_attempt(
+                fetch_id, app_id, country, attempt_index, policy_url,
+                canonical_policy_url, source, status, fetch_method, text_chars,
+                quality, quality_reason, error_class, error_message, created_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fetch_id,
+                fetch["app_id"],
+                fetch["country"],
+                int(attempt.get("attempt_index", index)),
+                policy_url,
+                attempt.get("canonical_policy_url") or policy_url,
+                attempt.get("source"),
+                attempt.get("status") or "unknown",
+                attempt.get("fetch_method"),
+                attempt.get("text_chars"),
+                attempt.get("quality"),
+                attempt.get("quality_reason"),
+                attempt.get("error_class"),
+                attempt.get("error_message"),
+                now,
+            ),
+        )
 
 
 def import_seeds(db_path: str | Path, rows: Iterable[dict]) -> dict[str, int]:
@@ -333,6 +395,7 @@ def complete_fetch(db_path: str | Path, fetch_id: int, result: dict) -> None:
                         "insert into policy_link(document_id, text, url) values (?, ?, ?)",
                         (document_id, link.get("text"), link["url"]),
                     )
+        save_policy_url_attempts(conn, fetch_id, result.get("policy_url_attempts") or [], now)
         conn.commit()
 
 
@@ -343,6 +406,7 @@ def fail_fetch(
     error_message: str,
     retryable: bool,
     max_attempts: int = 3,
+    policy_url_attempts: Iterable[dict] | None = None,
 ) -> None:
     now = utc_now()
     with closing(connect(db_path)) as conn:
@@ -368,6 +432,7 @@ def fail_fetch(
             """,
             (status, now if status == "pending" else None, error_class, error_message, now, fetch_id),
         )
+        save_policy_url_attempts(conn, fetch_id, policy_url_attempts or [], now)
         conn.commit()
 
 
@@ -378,6 +443,7 @@ def stats(db_path: str | Path) -> dict[str, int]:
             "seed_rows": conn.execute("select count(*) from app_seed").fetchone()[0],
             "policy_documents": conn.execute("select count(*) from policy_document").fetchone()[0],
             "policy_links": conn.execute("select count(*) from policy_link").fetchone()[0],
+            "policy_url_attempts": conn.execute("select count(*) from policy_url_attempt").fetchone()[0],
         }
         for status_name, key in [
             ("pending", "pending_fetches"),

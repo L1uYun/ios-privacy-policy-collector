@@ -199,6 +199,9 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         self.assertEqual(candidates[0], "https://developer.example.com/privacy")
         self.assertIn("https://developer.example.com/privacy-policy", candidates)
         self.assertIn("https://developer.example.com/legal/privacy", candidates)
+        self.assertIn("https://developer.example.com/policies/privacy-policy", candidates)
+        self.assertIn("https://developer.example.com/privacy-center", candidates)
+        self.assertIn("https://developer.example.com/legal/terms-of-use", candidates)
 
     def test_fallback_policy_urls_skip_app_store_origin(self):
         record = self.collector.AppRecord(
@@ -288,6 +291,67 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         self.assertEqual(row["policy_text_quality"], "ok")
         self.assertEqual(row["policy_fetch_method"], "js")
         self.assertIn("Terms of Service", markdown)
+
+    def test_collect_app_continues_after_candidate_js_timeout(self):
+        record = self.collector.AppRecord(
+            app_id="1234567890",
+            name="Example App",
+            bundle_id=None,
+            seller_name="Example Inc.",
+            app_store_url="https://apps.apple.com/us/app/example/id1234567890",
+            seller_url="https://example.com",
+            source="test",
+            raw={},
+        )
+        app_html = """
+            <html><body>
+            <a href="https://example.com/privacy-center">Developer Privacy Policy</a>
+            </body></html>
+        """
+        pages = {
+            record.app_store_url: app_html,
+            "https://example.com/privacy-center": "<html><body>Loading</body></html>",
+            "https://example.com/privacy": """
+                <html><body>
+                <h1>Privacy Policy</h1>
+                <p>We process personal information to provide account services.</p>
+                </body></html>
+            """,
+        }
+
+        def fake_request_text(url, timeout, user_agent, proxy=None):
+            return pages[url]
+
+        def fake_render(url, timeout, user_agent, proxy=None, wait_ms=0):
+            raise TimeoutError("render timed out")
+
+        original_request_text = self.collector.request_text
+        try:
+            self.collector.request_text = fake_request_text
+            with tempfile.TemporaryDirectory() as tmpdir:
+                args = argparse.Namespace(
+                    output_dir=tmpdir,
+                    timeout=10,
+                    fallback_timeout=5,
+                    user_agent="test-agent",
+                    proxy=None,
+                    min_policy_chars=50,
+                    js_fallback=True,
+                    js_timeout=1,
+                    js_wait_ms=100,
+                    render_text=fake_render,
+                    try_common_paths=True,
+                    no_fetch_policy=False,
+                )
+                row = self.collector.collect_app(record, args, "us")
+        finally:
+            self.collector.request_text = original_request_text
+
+        self.assertIsNone(row["error"])
+        self.assertEqual(row["policy_url"], "https://example.com/privacy")
+        self.assertEqual(row["policy_text_quality"], "ok")
+        self.assertEqual([attempt["status"] for attempt in row["policy_url_attempts"]], ["error", "accepted"])
+        self.assertEqual(row["policy_url_attempts"][0]["error_class"], "TimeoutError")
 
     def test_builds_records_from_offline_lookup_result(self):
         lookup_payload = {
