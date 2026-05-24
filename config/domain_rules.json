@@ -1,0 +1,83 @@
+{
+  "rules": [
+    {
+      "id": "openai",
+      "match": {
+        "seller_contains": ["OpenAI"],
+        "bundle_prefixes": ["com.openai."],
+        "seller_hosts": ["openai.com"]
+      },
+      "policy_urls": [
+        "https://openai.com/policies/privacy-policy",
+        "https://openai.com/policies/terms-of-use"
+      ],
+      "browser_first": true
+    },
+    {
+      "id": "uber",
+      "match": {
+        "seller_contains": ["Uber"],
+        "bundle_prefixes": ["com.ubercab."],
+        "seller_hosts": ["uber.com"]
+      },
+      "policy_urls": [
+        "https://www.uber.com/legal/en/document/?name=privacy-notice&country=united-states&lang=en",
+        "https://www.uber.com/legal/en/document/?name=general-terms-of-use&country=united-states&lang=en"
+      ],
+      "browser_first": true
+    },
+    {
+      "id": "meta",
+      "match": {
+        "seller_contains": ["Instagram", "Meta", "Facebook"],
+        "bundle_prefixes": ["com.burbn.", "com.facebook."],
+        "seller_hosts": ["instagram.com", "facebook.com", "meta.com"]
+      },
+      "policy_urls": [
+        "https://privacycenter.instagram.com/policy",
+        "https://www.facebook.com/privacy/policy/",
+        "https://www.facebook.com/legal/terms"
+      ],
+      "browser_first": true
+    },
+    {
+      "id": "spotify",
+      "match": {
+        "seller_contains": ["Spotify"],
+        "bundle_prefixes": ["com.spotify."],
+        "seller_hosts": ["spotify.com"]
+      },
+      "policy_urls": [
+        "https://www.spotify.com/legal/privacy-policy/",
+        "https://www.spotify.com/legal/end-user-agreement/"
+      ],
+      "browser_first": true
+    },
+    {
+      "id": "ryanair",
+      "match": {
+        "seller_contains": ["Ryanair"],
+        "bundle_prefixes": ["com.ryanair."],
+        "seller_hosts": ["ryanair.com"]
+      },
+      "policy_urls": [
+        "https://www.ryanair.com/gb/en/corporate/privacy-policy",
+        "https://www.ryanair.com/gb/en/terms-and-conditions"
+      ],
+      "browser_first": true
+    },
+    {
+      "id": "tesco",
+      "match": {
+        "seller_contains": ["Tesco"],
+        "bundle_prefixes": ["com.tesco."],
+        "seller_hosts": ["tesco.com"]
+      },
+      "policy_urls": [
+        "https://www.tesco.com/help/privacy-and-cookies/privacy-centre/privacy-policy-information/privacy-policy/",
+        "https://www.tesco.com/help/terms-and-conditions/"
+      ],
+      "browser_first": true
+    }
+  ]
+}

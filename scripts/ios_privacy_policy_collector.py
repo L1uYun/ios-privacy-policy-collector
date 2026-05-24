@@ -29,11 +29,17 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 ITUNES_LOOKUP_URL = "https://itunes.apple.com/lookup"
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 APPLE_RSS_TOP_FREE_URL = "https://rss.applemarketingtools.com/api/v2/{country}/apps/top-free/{limit}/apps.json"
 APPLE_RSS_TOP_PAID_URL = "https://rss.applemarketingtools.com/api/v2/{country}/apps/top-paid/{limit}/apps.json"
 DEFAULT_USER_AGENT = "privacy-policy-ios-collector/0.1 (+research; contact: local)"
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 PRIVACY_JSON_FIELD_RE = re.compile(
     r'"(?P<key>privacyPolicyUrl|privacyPolicyURL|privacyUrl|privacyURL)"\s*:\s*"(?P<url>(?:\\.|[^"\\])*)"',
@@ -247,7 +253,13 @@ def build_opener(proxy: str | None) -> urllib.request.OpenerDirector:
 
 
 def request_text(url: str, timeout: int, user_agent: str, proxy: str | None = None) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    request = urllib.request.Request(url, headers=headers)
     opener = build_opener(proxy)
     with opener.open(request, timeout=timeout) as response:
         content_type = response.headers.get_content_charset() or "utf-8"
@@ -272,7 +284,14 @@ def render_text_with_playwright(
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(**launch_options)
         try:
-            context = browser.new_context(user_agent=user_agent)
+            context = browser.new_context(
+                user_agent=user_agent or DEFAULT_BROWSER_USER_AGENT,
+                locale="en-US",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "DNT": "1",
+                },
+            )
             page = context.new_page()
             blocked_resource_types = {"image", "media", "font"}
             blocked_url_fragments = [
@@ -621,6 +640,63 @@ def common_privacy_url_candidates(base_url: str) -> list[str]:
     return [origin + path for path in paths]
 
 
+def default_domain_rules_path() -> Path:
+    return SCRIPT_DIR.parent / "config" / "domain_rules.json"
+
+
+def load_domain_rules(path: str | Path | None) -> list[dict]:
+    if not path:
+        path = default_domain_rules_path()
+    rules_path = Path(path)
+    if not rules_path.exists():
+        return []
+    payload = json.loads(rules_path.read_text(encoding="utf-8"))
+    return list(payload.get("rules") or [])
+
+
+def host_matches(host: str, patterns: list[str]) -> bool:
+    host = host.lower()
+    for pattern in patterns:
+        pattern = pattern.lower()
+        if host == pattern or host.endswith("." + pattern):
+            return True
+    return False
+
+
+def rule_matches_record(rule: dict, record: AppRecord) -> bool:
+    match = rule.get("match") or {}
+    seller = (record.seller_name or "").lower()
+    name = (record.name or "").lower()
+    bundle = (record.bundle_id or "").lower()
+    seller_host = (urllib.parse.urlparse(record.seller_url or "").hostname or "").lower()
+    for value in match.get("seller_contains") or []:
+        needle = str(value).lower()
+        if needle and (needle in seller or needle in name):
+            return True
+    for prefix in match.get("bundle_prefixes") or []:
+        if bundle.startswith(str(prefix).lower()):
+            return True
+    if seller_host and host_matches(seller_host, match.get("seller_hosts") or []):
+        return True
+    return False
+
+
+def domain_rule_policy_candidates(record: AppRecord, rules_path: str | Path | None = None) -> list[dict]:
+    candidates: list[dict] = []
+    for rule in load_domain_rules(rules_path):
+        if not rule_matches_record(rule, record):
+            continue
+        for url in rule.get("policy_urls") or []:
+            candidates.append(
+                {
+                    "url": str(url),
+                    "source": f"domain-rule:{rule.get('id') or 'unknown'}",
+                    "browser_first": bool(rule.get("browser_first")),
+                }
+            )
+    return candidates
+
+
 def slug(value: str | None, fallback: str) -> str:
     value = value or fallback
     value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
@@ -806,22 +882,35 @@ def fetch_policy_candidate(
     args: argparse.Namespace,
     app_dir: Path,
     suffix: str,
+    source: str = "primary",
+    browser_first: bool = False,
 ) -> dict:
     attempt = {
         "policy_url": policy_url,
         "canonical_policy_url": policy_url,
         "attempt_index": None,
-        "source": "primary" if not suffix else "fallback",
+        "source": source,
         "status": "started",
-        "fetch_method": "static",
+        "fetch_method": "js" if browser_first else "static",
         "text_chars": 0,
         "quality": None,
         "quality_reason": None,
         "error_class": None,
         "error_message": None,
     }
-    policy_html = request_text(policy_url, args.timeout, args.user_agent, proxy=args.proxy)
-    fetch_method = "static"
+    if browser_first:
+        render_text = getattr(args, "render_text", render_text_with_playwright)
+        policy_html = render_text(
+            policy_url,
+            getattr(args, "js_timeout", args.timeout),
+            getattr(args, "browser_user_agent", DEFAULT_BROWSER_USER_AGENT),
+            proxy=args.proxy,
+            wait_ms=getattr(args, "js_wait_ms", 2000),
+        )
+        fetch_method = "js"
+    else:
+        policy_html = request_text(policy_url, args.timeout, args.user_agent, proxy=args.proxy)
+        fetch_method = "static"
     policy_text = html_to_text(policy_html)
     policy_markdown, markdown_method, policy_links = best_markdown_and_links(policy_html, policy_url)
     quality, quality_reason = policy_text_quality(policy_text, args.min_policy_chars)
@@ -830,7 +919,7 @@ def fetch_policy_candidate(
         rendered_html = render_text(
             policy_url,
             getattr(args, "js_timeout", args.timeout),
-            args.user_agent,
+            getattr(args, "browser_user_agent", DEFAULT_BROWSER_USER_AGENT),
             proxy=args.proxy,
             wait_ms=getattr(args, "js_wait_ms", 2000),
         )
@@ -893,6 +982,10 @@ def fallback_policy_urls(record: AppRecord, primary_url: str | None) -> Iterator
                 continue
             seen.add(candidate)
             yield candidate
+
+
+def candidate_dict(url: str, source: str, browser_first: bool = False) -> dict:
+    return {"url": url, "source": source, "browser_first": browser_first}
 
 
 def collect_app(record: AppRecord, args: argparse.Namespace, country: str) -> dict:
@@ -959,20 +1052,40 @@ def collect_app(record: AppRecord, args: argparse.Namespace, country: str) -> di
             return row
 
         candidate_errors: list[str] = []
-        candidate_urls = [privacy_result.url] if privacy_result else []
+        candidate_urls: list[dict] = []
+        seen_candidates: set[str] = set()
+        for candidate in domain_rule_policy_candidates(record, getattr(args, "domain_rules", None)):
+            if candidate["url"] not in seen_candidates:
+                candidate_urls.append(candidate)
+                seen_candidates.add(candidate["url"])
+        if privacy_result and privacy_result.url not in seen_candidates:
+            candidate_urls.append(candidate_dict(privacy_result.url, f"app-store:{privacy_result.method}", False))
+            seen_candidates.add(privacy_result.url)
         if args.try_common_paths:
-            candidate_urls.extend(fallback_policy_urls(record, privacy_result.url if privacy_result else None))
+            for fallback_url in fallback_policy_urls(record, privacy_result.url if privacy_result else None):
+                if fallback_url not in seen_candidates:
+                    candidate_urls.append(candidate_dict(fallback_url, "common-path", False))
+                    seen_candidates.add(fallback_url)
         if not candidate_urls:
             row["error"] = "privacy policy URL not found on App Store page"
             return row
 
-        for index, candidate_url in enumerate(candidate_urls):
+        for index, candidate in enumerate(candidate_urls):
+            candidate_url = candidate["url"]
             suffix = "" if index == 0 else f"-fallback-{index}"
             try:
                 previous_timeout = args.timeout
                 if index > 0:
                     args.timeout = args.fallback_timeout
-                candidate_row = fetch_policy_candidate(candidate_url, record, args, app_dir, suffix)
+                candidate_row = fetch_policy_candidate(
+                    candidate_url,
+                    record,
+                    args,
+                    app_dir,
+                    suffix,
+                    source=candidate.get("source") or ("primary" if index == 0 else "fallback"),
+                    browser_first=bool(candidate.get("browser_first")),
+                )
             except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, UnicodeError, RuntimeError) as exc:
                 candidate_errors.append(f"{candidate_url}: {type(exc).__name__}: {exc}")
                 row["policy_url_attempts"].append(
@@ -980,9 +1093,9 @@ def collect_app(record: AppRecord, args: argparse.Namespace, country: str) -> di
                         "policy_url": candidate_url,
                         "canonical_policy_url": candidate_url,
                         "attempt_index": index,
-                        "source": "primary" if index == 0 else "fallback",
+                        "source": candidate.get("source") or ("primary" if index == 0 else "fallback"),
                         "status": "error",
-                        "fetch_method": "js" if getattr(args, "js_fallback", False) else "static",
+                        "fetch_method": "js" if candidate.get("browser_first") or getattr(args, "js_fallback", False) else "static",
                         "text_chars": 0,
                         "quality": None,
                         "quality_reason": None,
@@ -1037,6 +1150,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fallback-timeout", type=int, default=12, help="HTTP timeout for common-path fallback candidates.")
     parser.add_argument("--sleep", type=float, default=1.0, help="Delay between app collections.")
     parser.add_argument("--user-agent", default=os.environ.get("IOS_POLICY_USER_AGENT", DEFAULT_USER_AGENT))
+    parser.add_argument("--browser-user-agent", default=os.environ.get("IOS_POLICY_BROWSER_USER_AGENT", DEFAULT_BROWSER_USER_AGENT))
     parser.add_argument("--proxy", default=os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY"), help="Optional HTTP(S) proxy URL, for example http://127.0.0.1:7890.")
     parser.add_argument("--no-fetch-policy", action="store_true", help="Only discover policy URLs; do not fetch policy pages.")
     parser.add_argument("--min-policy-chars", type=int, default=1000, help="Minimum extracted text length to count as a full policy candidate.")
@@ -1044,6 +1158,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--js-timeout", type=int, default=60, help="Playwright rendering timeout in seconds.")
     parser.add_argument("--js-wait-ms", type=int, default=2000, help="Extra wait after DOMContentLoaded before saving rendered HTML.")
     parser.add_argument("--try-common-paths", action="store_true", help="If the explicit policy URL is missing or too short, try common privacy paths on seller/app origins.")
+    parser.add_argument("--domain-rules", default=str(default_domain_rules_path()), help="JSON file with auditable domain-specific policy URL rules.")
     parser.add_argument("--enrich-lookup", action="store_true", help="For chart seeds, call iTunes lookup per app to add sellerUrl and bundleId before fetching policies.")
     parser.add_argument("--resume", action="store_true", help="Skip country/app pairs already completed in the JSONL output.")
     parser.add_argument("--max-apps", type=int, default=0, help="Stop after collecting this many new country/app pairs. 0 means no cap.")

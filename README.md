@@ -482,6 +482,17 @@ Current failure-repair hooks:
 - `--js-fallback` uses Chromium for short or blocked pages.
 - candidate failures continue to the next URL instead of failing the entire app.
 - `scripts/run_batch.py` runs multi-worker batches and writes live summaries.
+- `config/domain_rules.json` stores auditable domain-specific policy URL rules.
+  Rules can mark a domain as `browser_first` for sites that return 403/406 or
+  require JavaScript. The default rules currently cover OpenAI, Uber, Meta,
+  Spotify, Ryanair, and Tesco.
+
+The first domain-rule regression on the remaining 20 failed pilot rows recovered
+8 rows, all through auditable `domain-rule:*` attempts. The report is written to:
+
+```text
+F:\ios-privacy-policy-collector\data\failed-20-domain-rules\failed-20-domain-rules-summary.json
+```
 
 Next useful failure reducers:
 

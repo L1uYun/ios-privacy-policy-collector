@@ -220,6 +220,24 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         self.assertTrue(candidates)
         self.assertTrue(all("developer.example.com" in url for url in candidates))
 
+    def test_domain_rules_add_auditable_policy_candidates(self):
+        record = self.collector.AppRecord(
+            app_id="6448311069",
+            name="ChatGPT",
+            bundle_id="com.openai.chat",
+            seller_name="OpenAI OpCo, LLC",
+            app_store_url="https://apps.apple.com/us/app/chatgpt/id6448311069",
+            seller_url="https://openai.com/chatgpt",
+            source="test",
+            raw={},
+        )
+
+        candidates = self.collector.domain_rule_policy_candidates(record, self.collector.default_domain_rules_path())
+
+        self.assertEqual(candidates[0]["url"], "https://openai.com/policies/privacy-policy")
+        self.assertEqual(candidates[0]["source"], "domain-rule:openai")
+        self.assertTrue(candidates[0]["browser_first"])
+
     def test_quality_flags_redirect_shell_as_too_short(self):
         quality, reason = self.collector.policy_text_quality("Privacy Center", 100)
 
