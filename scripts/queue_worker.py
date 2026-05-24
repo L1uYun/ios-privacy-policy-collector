@@ -27,6 +27,7 @@ collector = load_script_module(
     "ios_privacy_policy_collector",
     SCRIPT_DIR / "ios_privacy_policy_collector.py",
 )
+policy_cluster = load_script_module("policy_cluster", SCRIPT_DIR / "policy_cluster.py")
 
 
 def links_from_jsonl_text(text: str) -> list[dict]:
@@ -85,6 +86,10 @@ def queue_result_from_collector_row(row: dict, links: list[dict]) -> dict:
         "policy_markdown_path": row.get("policy_markdown_path"),
         "policy_html_path": row.get("policy_html_path"),
         "policy_text_path": row.get("policy_text_path"),
+        "policy_cluster_manifest_path": row.get("policy_cluster_manifest_path"),
+        "policy_cluster_nodes_count": row.get("policy_cluster_nodes_count"),
+        "policy_cluster_edges_count": row.get("policy_cluster_edges_count"),
+        "policy_cluster_errors_count": row.get("policy_cluster_errors_count"),
         "policy_links": links,
     }
 
@@ -105,6 +110,29 @@ def collect_task(task: dict, args: argparse.Namespace) -> dict:
     row = collector.collect_app(record, args, country=task["country"])
     if row.get("error") or row.get("policy_text_quality") != "ok":
         raise RuntimeError(row.get("error") or row.get("policy_text_quality") or "collector failed")
+    if args.collect_cluster:
+        cluster_dir = Path(row["policy_markdown_path"]).parent / "policy-cluster"
+
+        def fetch(url: str) -> str:
+            if url == row["policy_url"] and row.get("policy_html_path"):
+                html_path = Path(row["policy_html_path"])
+                if html_path.exists():
+                    return html_path.read_text(encoding="utf-8")
+            return collector.request_text(url, args.timeout, args.user_agent, proxy=args.proxy)
+
+        cluster_result = policy_cluster.collect_policy_cluster(
+            root_url=row["policy_url"],
+            output_dir=cluster_dir,
+            fetch_text=fetch,
+            max_depth=args.cluster_max_depth,
+            max_docs=args.cluster_max_docs,
+            min_chars=args.cluster_min_chars,
+            probe_common_paths=args.cluster_probe_common_paths,
+        )
+        row["policy_cluster_manifest_path"] = cluster_result["manifest_path"]
+        row["policy_cluster_nodes_count"] = cluster_result["nodes_count"]
+        row["policy_cluster_edges_count"] = cluster_result["edges_count"]
+        row["policy_cluster_errors_count"] = cluster_result["errors_count"]
     return queue_result_from_collector_row(row, load_links(row.get("policy_links_path")))
 
 
@@ -125,6 +153,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-policy-chars", type=int, default=1000)
     parser.add_argument("--try-common-paths", action="store_true")
     parser.add_argument("--enrich-lookup", action="store_true")
+    parser.add_argument("--collect-cluster", action="store_true", help="Archive linked legal/privacy documents as a policy cluster.")
+    parser.add_argument("--cluster-max-depth", type=int, default=1)
+    parser.add_argument("--cluster-max-docs", type=int, default=12)
+    parser.add_argument("--cluster-min-chars", type=int, default=200)
+    parser.add_argument("--cluster-probe-common-paths", action="store_true")
     return parser
 
 

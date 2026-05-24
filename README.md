@@ -19,6 +19,12 @@ For each app/country pair, the script can save:
   to absolute URLs.
 - `privacy-policy.txt`: plain text fallback for length and quality checks.
 - `privacy-policy.links.jsonl`: links extracted from the Markdown/HTML.
+- `policy-cluster/cluster.json`: optional manifest for the root policy plus
+  linked user agreements, terms, cookie policies, data/children notices,
+  permission statements, and other related legal documents.
+- `policy-cluster/nodes/*.{html,md,txt,links.jsonl}`: archived pages in the
+  protocol cluster. Markdown keeps absolute links so downstream readers can
+  follow the original references.
 - `results.jsonl`: one metadata row per attempted app/country pair.
 
 The script rejects Apple-owned App Store privacy/cookie helper pages as policy
@@ -133,8 +139,48 @@ python scripts/queue_worker.py \
   --jsonl F:\ios-privacy-policy-collector\data\worker-results.jsonl \
   --proxy http://127.0.0.1:7890 \
   --try-common-paths \
-  --enrich-lookup
+  --enrich-lookup \
+  --collect-cluster \
+  --cluster-probe-common-paths
 ```
+
+## Policy Cluster Mode
+
+The collector can archive more than the privacy-policy entry page. Policy
+cluster mode starts from the resolved developer privacy policy URL, saves that
+root document, then follows same-domain legal/privacy links such as terms,
+user agreements, cookie policies, children/privacy notices, data policies,
+permission statements, third-party sharing lists, and related notices.
+
+Run it directly for a single known policy URL:
+
+```bash
+python scripts/policy_cluster.py \
+  https://www.doubao.com/legal/privacy \
+  --output-dir F:\ios-privacy-policy-collector\data\smoke\doubao-policy-cluster \
+  --proxy http://127.0.0.1:7890 \
+  --max-depth 1 \
+  --max-docs 12
+```
+
+For higher recall, add common same-domain path probing:
+
+```bash
+python scripts/policy_cluster.py \
+  https://www.doubao.com/legal/privacy \
+  --output-dir F:\ios-privacy-policy-collector\data\smoke\doubao-policy-cluster-probe \
+  --proxy http://127.0.0.1:7890 \
+  --max-depth 1 \
+  --max-docs 30 \
+  --probe-common-paths
+```
+
+Common-path probing tries routes such as `/terms`, `/legal/terms`,
+`/cookie-policy`, `/children-privacy`, `/data-policy`, and `/permissions`.
+Short shell pages and failed probes are recorded as manifest errors rather than
+accepted as cluster nodes. Explicit links found inside the root policy are kept
+as evidence even when their quality flag is weak, because they were referenced
+by the policy itself.
 
 ## Inputs
 
@@ -156,6 +202,8 @@ This is not a full million-app crawler by itself. For large runs:
 - Add a queue database and multiple workers.
 - Add Playwright or another browser-rendering fallback for JS-heavy or blocked
   pages.
+- Use policy cluster mode for high-quality runs so privacy policies, user
+  agreements, cookie/data notices, and linked legal documents stay connected.
 - Apply per-domain rate limits and keep failure reasons auditable.
 
 ## Roadmap For 1M App Store Apps
@@ -181,6 +229,7 @@ These are different workloads. Many apps share the same company policy URL, so
 
 - Keep Markdown as the primary artifact.
 - Preserve absolute links in Markdown.
+- Archive policy clusters, not only a single privacy-policy page.
 - Store raw App Store HTML and raw policy HTML as evidence.
 - Reject Apple-owned App Store privacy/cookie helper pages as developer policy
   targets.
@@ -252,6 +301,7 @@ permanent_error
 - Enforce per-domain concurrency and rate limits.
 - Save raw HTML, Markdown, plain text, extracted links, hashes, and quality
   flags.
+- Save cluster manifests with nodes and edges for linked legal documents.
 
 ### Phase 5: Quality And Deduplication
 

@@ -126,6 +126,9 @@ class QueueStoreTests(unittest.TestCase):
                 "policy_markdown_path": "out/us/123/privacy-policy.md",
                 "policy_html_path": "out/us/123/privacy-policy.html",
                 "policy_text_path": "out/us/123/privacy-policy.txt",
+                "policy_cluster_manifest_path": "out/us/123/policy-cluster/cluster.json",
+                "policy_cluster_nodes_count": 3,
+                "policy_cluster_edges_count": 2,
                 "policy_links": [
                     {"text": "Contact", "url": "https://example.com/contact"}
                 ],
@@ -136,6 +139,12 @@ class QueueStoreTests(unittest.TestCase):
         self.assertEqual(stats["ok_fetches"], 1)
         self.assertEqual(stats["policy_documents"], 1)
         self.assertEqual(stats["policy_links"], 1)
+        with closing(self.queue.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "select policy_cluster_manifest_path, policy_cluster_nodes_count from policy_document"
+            ).fetchone()
+        self.assertEqual(row["policy_cluster_manifest_path"], "out/us/123/policy-cluster/cluster.json")
+        self.assertEqual(row["policy_cluster_nodes_count"], 3)
 
     def test_fail_fetch_can_retry_then_become_permanent(self):
         self.queue.init_db(self.db_path)
