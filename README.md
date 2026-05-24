@@ -363,18 +363,43 @@ Run staged pilots before the 1M run:
 No single public Apple endpoint gives a full current catalog, so use a layered
 seed strategy.
 
+At million scale, the expected yield is:
+
+```text
+usable policy clusters = seed rows * active-app validation rate * policy success rate
+```
+
+So the work splits into two tracks: collect far more than 1M candidate seed rows,
+then keep reducing policy-fetch failure on a fixed regression set.
+
 ### 1. Public App Store Metadata Dumps
 
 Start here if the license permits reuse.
 
 - Large public app metadata datasets, for example
   `gauthamp10/apple-appstore-apps`.
+- AppGoblin-style public app metadata exports with iOS `store_id` values.
 - Research datasets from App Store privacy-label studies that report large
   App Store snapshots.
 - Other public App Store ID dumps with clear provenance.
 
 Use these as candidate seed lists, then refresh each app through iTunes lookup.
 Do not assume old datasets still represent active apps.
+
+For AppGoblin-style TSV/CSV dumps, import iOS rows with:
+
+```bash
+python scripts/import_seed_dump.py \
+  --input F:\ios-privacy-policy-collector\data\seed-dumps\live_store_apps.tsv.xz \
+  --format appgoblin \
+  --source appgoblin-live-store-apps \
+  --country us \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite
+```
+
+The importer accepts `.tsv`, `.csv`, `.tsv.xz`, and `.csv.xz`, extracts numeric
+App Store IDs from `store_id`, `app_id`, `id`, or App Store URLs, filters iOS
+rows when a `store/platform` column exists, and writes queue-ready seeds.
 
 ### 2. Apple Public Interfaces
 
@@ -437,11 +462,36 @@ Do not claim catalog completeness from keyword expansion alone.
 
 ### Recommended Seed Plan
 
-1. Import one license-compatible public large app-ID dataset.
-2. Validate and refresh IDs through iTunes lookup.
-3. Add Common Crawl App Store URL discovery.
+1. Import one license-compatible public large app-ID dataset, preferably with
+   more than 1M candidate iOS rows because old dumps will include inactive apps.
+2. Validate and refresh IDs through iTunes lookup, keeping inactive and missing
+   IDs as separate seed-quality metrics.
+3. Add Common Crawl App Store URL discovery to increase long-tail coverage.
 4. Add Apple RSS/search for freshness and targeted gap filling.
 5. Add commercial metadata only if public seed quality is not enough.
+
+### Failure-Rate Track
+
+Seed volume is not sufficient if policy fetch failure stays high. Keep a
+regression set of failed apps and re-run it after URL-discovery changes.
+
+Current failure-repair hooks:
+
+- `policy_url_attempt` records every candidate URL, status, fetch method,
+  extracted length, quality flag, and error.
+- `--js-fallback` uses Chromium for short or blocked pages.
+- candidate failures continue to the next URL instead of failing the entire app.
+- `scripts/run_batch.py` runs multi-worker batches and writes live summaries.
+
+Next useful failure reducers:
+
+- domain rules for high-volume sites with stable legal URLs.
+- Common Crawl / web-index URL discovery for apps whose iTunes `sellerUrl` is
+  missing.
+- browser-first mode for domains that consistently return 403/406 to static
+  HTTP.
+- cross-country reuse when the same `app_id` or `bundle_id` succeeds in another
+  storefront.
 
 ## Tests
 
