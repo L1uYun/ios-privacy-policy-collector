@@ -78,6 +78,28 @@ def init_db(db_path: str | Path) -> None:
                 unique(country, app_id)
             );
 
+            create table if not exists seed_validation (
+                validation_id integer primary key,
+                seed_id integer not null references app_seed(seed_id) on delete cascade,
+                seed_source text not null,
+                app_id text not null,
+                country text not null,
+                status text not null,
+                result_count integer,
+                http_status integer,
+                track_id text,
+                bundle_id text,
+                name text,
+                seller_name text,
+                app_store_url text,
+                lookup_url text,
+                error_class text,
+                error_message text,
+                raw_json text,
+                validated_at text not null,
+                unique(seed_id)
+            );
+
             create table if not exists policy_url_candidate (
                 candidate_id integer primary key,
                 app_id text not null,
@@ -167,6 +189,8 @@ def init_db(db_path: str | Path) -> None:
                 on policy_fetch(status, next_attempt_at, fetch_id);
             create index if not exists idx_policy_document_hash
                 on policy_document(policy_text_sha256);
+            create index if not exists idx_seed_validation_status
+                on seed_validation(status, country, seed_source);
             create index if not exists idx_policy_url_candidate_url
                 on policy_url_candidate(canonical_policy_url);
             create index if not exists idx_policy_url_attempt_fetch
@@ -441,10 +465,16 @@ def stats(db_path: str | Path) -> dict[str, int]:
     with closing(connect(db_path)) as conn:
         values = {
             "seed_rows": conn.execute("select count(*) from app_seed").fetchone()[0],
+            "seed_validations": conn.execute("select count(*) from seed_validation").fetchone()[0],
             "policy_documents": conn.execute("select count(*) from policy_document").fetchone()[0],
             "policy_links": conn.execute("select count(*) from policy_link").fetchone()[0],
             "policy_url_attempts": conn.execute("select count(*) from policy_url_attempt").fetchone()[0],
         }
+        for status_name in ["active", "inactive", "missing", "lookup_error"]:
+            values[f"{status_name}_seed_validations"] = conn.execute(
+                "select count(*) from seed_validation where status = ?",
+                (status_name,),
+            ).fetchone()[0]
         for status_name, key in [
             ("pending", "pending_fetches"),
             ("running", "running_fetches"),

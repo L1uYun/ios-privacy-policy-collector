@@ -401,6 +401,51 @@ The importer accepts `.tsv`, `.csv`, `.tsv.xz`, and `.csv.xz`, extracts numeric
 App Store IDs from `store_id`, `app_id`, `id`, or App Store URLs, filters iOS
 rows when a `store/platform` column exists, and writes queue-ready seeds.
 
+For appstoredb-style SQLite dumps, import directly from the `apps` table and,
+when present, join `stores` for storefront-specific canonical URLs:
+
+```bash
+python scripts/import_seed_dump.py \
+  --input F:\ios-privacy-policy-collector\data\seed-dumps\appstoredb\appstore_sample.sqlite \
+  --format appstoredb-sqlite \
+  --source appstoredb-sample-2025-11 \
+  --country us \
+  --output-csv F:\ios-privacy-policy-collector\data\appstoredb-sample-seeds.csv \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite
+```
+
+The public appstoredb Hugging Face repository currently exposes a 211 MB sample
+SQLite file, not the full database described in the dataset card. The sample
+contains 1,000 apps and 17,227 storefront rows; importing and validating it
+added 17,227 seed rows in the local queue, with 17,115 active, 112 inactive,
+and zero lookup errors. If the full appstoredb SQLite database is obtained
+later, the same importer can ingest it without a schema change.
+
+After importing a dump, validate seed liveness before spending policy-fetch
+budget:
+
+```bash
+python scripts/validate_itunes_seeds.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  --limit 100000 \
+  --batch-size 100 \
+  --sleep 0.05 \
+  --proxy http://127.0.0.1:7890 \
+  --output-json F:\ios-privacy-policy-collector\data\seed-validation-100k.json \
+  --output-csv F:\ios-privacy-policy-collector\data\seed-validation-100k.csv
+```
+
+The validator writes one `seed_validation` row per `app_seed` row and separates:
+
+- `active`: iTunes lookup returned a software result.
+- `inactive`: lookup succeeded but returned zero results for that country.
+- `missing`: reserved for unusable seed rows or `--zero-result-status missing`.
+- `lookup_error`: HTTP, timeout, proxy, or malformed JSON failure.
+
+`python scripts/queue_store.py --db F:\ios-privacy-policy-collector\data\queue.sqlite stats`
+includes these validation counters, so dump quality can be measured before the
+full crawler run.
+
 ### 2. Apple Public Interfaces
 
 Use official Apple surfaces for validation and enrichment.
@@ -426,6 +471,64 @@ https://apps.apple.com/*/app/*/id*
 
 Then extract numeric app IDs, deduplicate, and validate with iTunes lookup.
 Keep the Common Crawl index path and timestamp as provenance.
+
+Run a bounded discovery slice first:
+
+```bash
+python scripts/discover_commoncrawl_appstore_urls.py \
+  --index latest \
+  --url-pattern "apps.apple.com/us/app/" \
+  --match-type prefix \
+  --limit 10000 \
+  --proxy http://127.0.0.1:7890 \
+  --output-csv F:\ios-privacy-policy-collector\data\commoncrawl-appstore-10k.csv \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite
+```
+
+The script streams Common Crawl CDX JSON lines, keeps only
+`apps.apple.com/<country>/app/.../id<digits>` product URLs, deduplicates by
+`(country, app_id)`, stores the CDX index and timestamp in `provenance_url`, and
+can import directly into `app_seed`. Prefix queries such as
+`apps.apple.com/us/app/` are more reliable than one broad wildcard query. Scale
+it by running multiple recent indexes and storefront prefixes, then measure the
+marginal active rate with `scripts/validate_itunes_seeds.py`.
+
+For multi-storefront discovery, use the runner so transient CDX failures are
+captured per country and retried with smaller server-side limits:
+
+```bash
+python scripts/discover_commoncrawl_countries.py \
+  --countries us,gb,ca,au,de,fr,jp,kr,cn,in,br,mx,es,it,nl \
+  --index CC-MAIN-2026-17 \
+  --limit 5000 \
+  --backend requests \
+  --proxy http://127.0.0.1:7890 \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  --output-dir F:\ios-privacy-policy-collector\data \
+  --summary-json F:\ios-privacy-policy-collector\data\commoncrawl-multicountry-summary.json
+```
+
+In the first verified run against `CC-MAIN-2026-17`, 15 storefront prefixes
+produced 20,424 seed rows. iTunes batch lookup validated 20,190 active and 234
+inactive rows, with no lookup errors. Older 2026 indexes tested with the same
+prefixes had zero marginal rows, so the next scale step should split the latest
+index more finely before spending time on older indexes.
+
+Export the active rows as the project-owned 2026 seed dump:
+
+```bash
+python scripts/export_seed_dump.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  --sources commoncrawl-appstore-url \
+  --status active \
+  --output-csv F:\ios-privacy-policy-collector\data\seed-dumps\ios-appstore-2026-commoncrawl-live-lookup-active-seeds.csv \
+  --summary-json F:\ios-privacy-policy-collector\data\seed-dumps\ios-appstore-2026-commoncrawl-live-lookup-active-seeds.summary.json
+```
+
+The first exported dump contains 20,190 active app-country rows from Common
+Crawl 2026 URLs validated by Apple iTunes lookup, covering 19,282 unique App
+Store IDs. Public 2023/2024/2025 dumps should be treated as supplemental seed
+sources unless their freshness and license are verified.
 
 ### 4. Commercial App Metadata APIs
 
@@ -462,11 +565,12 @@ Do not claim catalog completeness from keyword expansion alone.
 
 ### Recommended Seed Plan
 
-1. Import one license-compatible public large app-ID dataset, preferably with
-   more than 1M candidate iOS rows because old dumps will include inactive apps.
-2. Validate and refresh IDs through iTunes lookup, keeping inactive and missing
-   IDs as separate seed-quality metrics.
-3. Add Common Crawl App Store URL discovery to increase long-tail coverage.
+1. Keep the primary 2026 seed dump as Common Crawl 2026 App Store URLs validated
+   through Apple live iTunes lookup.
+2. Import license-compatible public large app-ID datasets only as supplemental
+   sources because old dumps will include inactive apps.
+3. Validate and refresh every source through iTunes lookup, keeping inactive and
+   missing IDs as separate seed-quality metrics.
 4. Add Apple RSS/search for freshness and targeted gap filling.
 5. Add commercial metadata only if public seed quality is not enough.
 

@@ -8,6 +8,7 @@ import csv
 import importlib.util
 import lzma
 import re
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Iterable, TextIO
@@ -88,6 +89,72 @@ def iter_appgoblin_rows(path: str | Path, seed_source: str, country: str, limit:
                 break
 
 
+def iter_appstoredb_sqlite_rows(path: str | Path, seed_source: str, country: str, limit: int | None = None) -> list[dict]:
+    path = Path(path)
+    seen: set[tuple[str, str]] = set()
+    rows: list[dict] = []
+    conn = sqlite3.connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        tables = {
+            row["name"]
+            for row in conn.execute("select name from sqlite_master where type = 'table'")
+        }
+        if "apps" not in tables:
+            raise ValueError("appstoredb sqlite input must contain an apps table")
+        has_stores = "stores" in tables
+        if has_stores:
+            query = """
+                select
+                    a.store_id,
+                    a.bundle_id,
+                    s.canonical_url,
+                    s.app_name,
+                    s.code
+                from apps a
+                left join stores s on s.int_app_id = a.int_id
+                order by a.int_id, s.code
+            """
+        else:
+            query = """
+                select
+                    store_id,
+                    bundle_id,
+                    null as canonical_url,
+                    null as app_name,
+                    null as code
+                from apps
+                order by int_id
+            """
+        count = 0
+        for row in conn.execute(query):
+            app_id = parse_app_id(row["store_id"])
+            if not app_id:
+                continue
+            row_country = str(row["code"] or country).lower()
+            if len(row_country) != 2:
+                row_country = country
+            key = (row_country, app_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "seed_source": seed_source,
+                "app_id": app_id,
+                "bundle_id": row["bundle_id"] or "",
+                "app_store_url": row["canonical_url"] or app_store_url(app_id, row_country),
+                "country": row_country,
+                "provenance_url": str(path),
+                "license_note": "Imported from appstoredb SQLite dataset; verify upstream license/provenance before redistribution.",
+            })
+            count += 1
+            if limit and count >= limit:
+                break
+    finally:
+        conn.close()
+    return rows
+
+
 def write_seed_csv(path: str | Path, rows: Iterable[dict]) -> int:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,8 +171,8 @@ def write_seed_csv(path: str | Path, rows: Iterable[dict]) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Import large iOS app seed dumps.")
-    parser.add_argument("--input", required=True, help="Input .tsv, .csv, .tsv.xz, or .csv.xz seed dump.")
-    parser.add_argument("--format", choices=["appgoblin"], default="appgoblin")
+    parser.add_argument("--input", required=True, help="Input .tsv, .csv, .tsv.xz, .csv.xz, or SQLite seed dump.")
+    parser.add_argument("--format", choices=["appgoblin", "appstoredb-sqlite"], default="appgoblin")
     parser.add_argument("--source", default="public-seed-dump")
     parser.add_argument("--country", default="us")
     parser.add_argument("--limit", type=int, default=None)
@@ -116,7 +183,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    rows = list(iter_appgoblin_rows(args.input, args.source, args.country, args.limit))
+    if args.format == "appgoblin":
+        rows = list(iter_appgoblin_rows(args.input, args.source, args.country, args.limit))
+    elif args.format == "appstoredb-sqlite":
+        rows = list(iter_appstoredb_sqlite_rows(args.input, args.source, args.country, args.limit))
+    else:
+        raise AssertionError(args.format)
     result = {"rows": len(rows)}
     if args.output_csv:
         result["output_csv_rows"] = write_seed_csv(args.output_csv, rows)
