@@ -166,6 +166,114 @@ For million-scale collection, run repeated batches against the same queue until
 candidate URL, fetch method, extracted length, quality flag, and error, which is
 the audit trail needed to repair failures without re-running successful apps.
 
+Scale in corpus milestones, not by jumping straight to the million target. Each
+stage has a different bottleneck, so do not unlock the next stage only because a
+large queue exists:
+
+| Stage | Target accepted policy clusters | Gate before expanding |
+| --- | ---: | --- |
+| 1 | 10,000 | stable Markdown output, resumable batches, failure categories visible, terminal success rate healthy |
+| 2 | 100,000 | enough active seeds, country/source mix selected by observed yield, Common Crawl/app dump quality measured |
+| 3 | 500,000 | repeated background batches without stale locks or disk layout issues, dedupe and disk budget verified |
+| 4 | 1,000,000 | seed coverage plus policy success rate supports the final run, restart/retry procedure proven |
+
+The milestone unit is an accepted `policy_document` with saved Markdown and
+policy-cluster artifacts, not just a seed row or a discovered policy URL. Check
+milestone progress with:
+
+```bash
+python scripts\milestone_status.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  --output-json F:\ios-privacy-policy-collector\data\milestone-status.json
+```
+
+The report includes a `stage_plan` object with the current milestone, remaining
+accepted policy clusters, active-seed surplus or deficit, expected yield from
+pending fetches at the observed terminal success rate, and the recommended next
+action. Treat that as the operational switch:
+
+- If 10k still has enough active seeds and expected pending yield, keep policy
+  workers running on the best observed sources.
+- If 100k shows an active-seed deficit, keep Common Crawl 2026 and Apple live
+  lookup running before increasing policy-worker volume.
+- If terminal success rate drops below the gate, stop expanding that source mix
+  and repair failures on a fixed regression set.
+- If a stage completes, freeze `milestone-status.json`, failure classification,
+  source/country yield, and the seed dump before opening the next stage.
+
+Create an auditable stage snapshot at any checkpoint:
+
+```bash
+python scripts\freeze_stage_snapshot.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  --data-root F:\ios-privacy-policy-collector\data \
+  --name stage1-10k-checkpoint
+```
+
+The snapshot writes a self-contained directory under
+`F:\ios-privacy-policy-collector\data\stage-snapshots` with milestone status,
+failure classification, Common Crawl shard progress, disk usage, and recent
+batch summaries. Use this before widening from 10k to 100k, then again at 500k
+and 1M gates.
+
+Classify permanent failures while the 10k stage is running:
+
+```bash
+python scripts\classify_policy_failures.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  --output-json F:\ios-privacy-policy-collector\data\policy-failure-classification.json
+```
+
+Start a resumable background policy-cluster batch for the current 10k stage:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\start_policy_cluster_batch.ps1 `
+  -Name stage1-10k `
+  -Workers 8 `
+  -LimitPerWorker 250 `
+  -Countries "es,it,nl" `
+  -Sources "apple-search:*"
+```
+
+### 2026-05-25 T430 10k Gate Snapshot
+
+The first T430 stage gate completed on 2026-05-25. The hot queue database was
+kept on NVMe, while policy-cluster artifacts were written under `/data`:
+
+```text
+Remote repo: /data/xiaolab-research/ios-privacy-policy-collector
+Hot DB: /mnt/data-nvme/ios-privacy-policy-collector/state/queue.sqlite
+Data root: /data/xiaolab-research/ios-privacy-policy-collector/data
+Snapshot: data/stage-snapshots/stage1-10k-auto-stop-reached-10000-20260525-135514
+Policy clusters: data/policy-clusters
+```
+
+The gate stopped at `policy_documents=10038`, with `running_fetches=0` after
+the auto-stop monitor stopped policy workers and cleared running fetch rows.
+The snapshot manifest recorded `policy_documents=10022` at freeze time, because
+some workers completed additional rows before the final post-stop stats check.
+
+To produce a shareable offline package on the Windows host, run:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\Export-T430Policy10kToF.ps1
+```
+
+Default outputs:
+
+```text
+F:\ios-privacy-policy-collector-10k
+F:\ios-privacy-policy-collector-10k.zip
+F:\ios-privacy-policy-collector-10k.sync.log
+F:\ios-privacy-policy-collector-10k.sync.err.log
+```
+
+The unzipped directory is the easiest way for reviewers to inspect the corpus.
+Open its `README.md`, then inspect
+`data/stage-snapshots/stage1-10k-auto-stop-reached-10000-20260525-135514/snapshot-manifest.json`
+for collection statistics and `data/policy-clusters/` for the Markdown policy
+clusters. The zip is only the transport copy of the same directory.
+
 ## Policy Cluster Mode
 
 The collector can archive more than the privacy-policy entry page. Policy
@@ -530,6 +638,49 @@ Crawl 2026 URLs validated by Apple iTunes lookup, covering 19,282 unique App
 Store IDs. Public 2023/2024/2025 dumps should be treated as supplemental seed
 sources unless their freshness and license are verified.
 
+For finer Common Crawl coverage, split App Store product slugs by generated
+prefix shards. This is resumable and writes one progress JSONL row per shard:
+
+```bash
+python scripts/discover_commoncrawl_slug_prefixes.py \
+  --countries us,gb,jp,de,fr,cn,in \
+  --prefix-lengths 2 \
+  --prefix-alphabet abcdefghijklmnopqrstuvwxyz \
+  --index CC-MAIN-2026-17 \
+  --limit 5000 \
+  --server-limit 5000 \
+  --fallback-server-limits 1000,500 \
+  --backend requests \
+  --timeout 120 \
+  --sleep 0.05 \
+  --retries 2 \
+  --resume-progress \
+  --progress-jsonl F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\wave1-us-gb-jp-de-fr-cn-in-2char.progress.jsonl \
+  --summary-json F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\wave1-us-gb-jp-de-fr-cn-in-2char.summary.json \
+  --output-dir F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\wave1-us-gb-jp-de-fr-cn-in-2char \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite
+```
+
+Summarize long-running shard progress without reading the full worker log:
+
+```bash
+python scripts\summarize_commoncrawl_progress.py \
+  --progress-jsonl F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\wave1-us-gb-jp-de-fr-cn-in-2char.progress.jsonl \
+  --total-shards 4732 \
+  --output-json F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\wave1-us-gb-jp-de-fr-cn-in-2char.progress-summary.json
+```
+
+On 2026-05-25, wave1 was restarted in direct mode from:
+
+```text
+F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\run-prefix-2026-17-wave1-direct.ps1
+```
+
+The Common Crawl CDX endpoint was more reliable without the local proxy in this
+run. The discovery client disables inherited environment proxies for direct
+runs, so a machine-wide `http_proxy` does not accidentally route CDX traffic
+through `127.0.0.1:7890`.
+
 ### 4. Commercial App Metadata APIs
 
 Commercial APIs may be the cleanest path to current 1M-scale coverage, but they
@@ -585,7 +736,27 @@ Current failure-repair hooks:
   extracted length, quality flag, and error.
 - `--js-fallback` uses Chromium for short or blocked pages.
 - candidate failures continue to the next URL instead of failing the entire app.
+- Apple platform/legal pages are rejected as developer policy URLs. This covers
+  `apps.apple.com` and country Apple legal/privacy domains such as
+  `apple.com`, `apple.com.cn`, `apple.fr`, and other `apple.*` hosts when the
+  path is under `/legal/`, `/privacy/`, `/cookies`, or a privacy endpoint.
+- App Store URL discovery uses layered fallbacks:
+  1. explicit App Store privacy-policy links and JSON privacy fields;
+  2. App Store external links such as `Developer Website`, `App Support`, and
+     JSON fields like `developerWebsite` or `appSupportUrl`;
+  3. iTunes `sellerUrl` and App Store external links as seller/support bases;
+  4. short-link expansion for common hosts such as `on.fb.me`, `bit.ly`,
+     `t.co`, and `tinyurl.com`;
+  5. seller/support homepage static parsing, then optional `--js-fallback`;
+  6. common legal paths, `robots.txt` sitemaps, and `sitemap.xml` /
+     `sitemap_index.xml` privacy-like URL ranking;
+  7. cross-country lookup for the same `app_id` when one storefront lacks a
+     usable developer policy link.
 - `scripts/run_batch.py` runs multi-worker batches and writes live summaries.
+- `scripts/queue_store.py requeue-running` can safely return stale `running`
+  fetches to `pending` by worker prefix or lock timestamp after a stopped batch.
+- `scripts/run_batch.py --active-only --countries us,gb,jp,de` claims only
+  iTunes-validated active seeds for higher-quality pilot batches.
 - `config/domain_rules.json` stores auditable domain-specific policy URL rules.
   Rules can mark a domain as `browser_first` for sites that return 403/406 or
   require JavaScript. The default rules currently cover OpenAI, Uber, Meta,
@@ -598,6 +769,88 @@ The first domain-rule regression on the remaining 20 failed pilot rows recovered
 F:\ios-privacy-policy-collector\data\failed-20-domain-rules\failed-20-domain-rules-summary.json
 ```
 
+### 2026-05-26 Apple Platform Rediscovery Repair
+
+The 10k review pack contained rows whose root URL resolved to Apple platform
+pages, including Apple Internet Services, App Store pages, and Apple privacy
+legal pages. Those are not developer privacy policies. On 2026-05-26 the
+Windows host rebuilt this subset with stricter Apple-domain rejection and the
+fallback stack above.
+
+Audited output files:
+
+```text
+F:\ios-privacy-policy-collector-10k\apple-platform-policy-rediscovery.csv
+F:\ios-privacy-policy-collector-10k\apple-platform-policy-rediscovery-final-audited-summary.json
+F:\ios-privacy-policy-collector-10k\apple-platform-policy-rediscovery-final-nonrecovered-classified.csv
+F:\ios-privacy-policy-collector-10k\apple-platform-policy-rediscovery-apple-rejected.csv
+```
+
+Final audited subset status:
+
+```text
+Apple-platform subset rows: 8074
+Developer policy recovered: 7873
+Apple/platform rejected: 97
+Network/error tail: 78
+Unrecovered: 25
+iTunes lookup missing: 1
+Developer-policy recovery rate in this subset: 97.511%
+```
+
+Important interpretation: `apple_platform_rejected` rows are not successful
+developer-policy recoveries. They are rows where discovery attempted to use an
+Apple country legal/privacy URL, such as `www.apple.fr/fr/legal/privacy/`, and
+the audit rejected it. Keep them out of third-party developer-policy success
+metrics or label them separately as Apple/platform policy rows.
+
+The tail file
+`apple-platform-policy-rediscovery-final-nonrecovered-classified.csv`
+classifies the 201 non-recovered rows into:
+
+- `apple_platform_or_first_party`: 97 rows, exclude or label separately.
+- `network_timeout_retryable`: 78 rows, retry later with lower concurrency and
+  direct/proxy A-B testing.
+- `no_seller_url_no_external_link`: 19 rows, requires web search or Common
+  Crawl by app name plus app ID because App Store metadata did not expose a
+  deterministic developer URL.
+- `seller_site_no_policy_found`: 4 rows, add domain rules or mark no visible
+  policy after manual review.
+- `deep_landing_seller_needs_search`: 2 rows, try origin search, sitemap, and
+  domain-specific rules.
+- `itunes_lookup_missing`: 1 row, validate in other storefronts or refresh the
+  seed.
+
+For targeted rediscovery of Apple-platform rows on another machine:
+
+```powershell
+python scripts\rediscover_apple_platform_policies.py `
+  --sample-index F:\ios-privacy-policy-collector-10k\sample-index.csv `
+  --output-dir F:\ios-privacy-policy-collector-10k `
+  --timeout 20 `
+  --hard-timeout 45 `
+  --proxy http://127.0.0.1:7890 `
+  --resume `
+  --workers 4 `
+  --sleep 0 `
+  --js-fallback
+```
+
+When syncing to T430, copy the repo changes first, then copy or regenerate the
+audited CSVs under the T430 data root. The T430 data root used for the 10k gate
+was:
+
+```text
+/data/xiaolab-research/ios-privacy-policy-collector/data
+```
+
+Suggested code sync from Windows, after committing the local changes:
+
+```powershell
+git push origin master
+ssh t430 "cd /data/xiaolab-research/ios-privacy-policy-collector && git pull --ff-only"
+```
+
 Next useful failure reducers:
 
 - domain rules for high-volume sites with stable legal URLs.
@@ -607,6 +860,81 @@ Next useful failure reducers:
   HTTP.
 - cross-country reuse when the same `app_id` or `bundle_id` succeeds in another
   storefront.
+
+### Current Background Runs
+
+As of 2026-05-25 09:42 Asia/Shanghai, these local background jobs were active:
+
+- Common Crawl 2026 prefix seed discovery, direct/no-proxy CDX mode:
+  `F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\run-prefix-2026-17-wave1-direct.ps1`
+- Apple live lookup for newly discovered queue rows:
+  `F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\run-wave1-live-lookup-export.ps1`
+- Policy-cluster batch4, 4 workers x 50 rows:
+  `F:\ios-privacy-policy-collector\data\policy-batch-bg\run-policy-cluster-batch4-apple-search-es-it-nl.ps1`
+- Policy-cluster batch5, 8 workers x 250 rows:
+  `F:\ios-privacy-policy-collector\data\policy-batch-bg\cluster-batch5-apple-search-es-it-nl-2000.*.log`
+- Stage 1 Common Crawl US pilot, 4 workers x 100 rows:
+  `F:\ios-privacy-policy-collector\data\policy-batch-bg\cluster-stage1-cc-us-pilot-400-20260525-093815.*.log`
+- Stage 1 Apple-search broad batch, 8 workers x 250 rows:
+  `F:\ios-privacy-policy-collector\data\policy-batch-bg\cluster-stage1-apple-search-broad-2000-20260525-094222.*.log`
+
+Batch4 and batch5 intentionally target `--active-only --countries es,it,nl
+--sources "apple-search:*" --claim-order newest --min-policy-chars 500`. This
+keeps early corpus growth on high-quality, recently discovered Apple live search
+seeds instead of burning time on old cold US rows.
+
+The Stage 1 Common Crawl pilot tests whether `commoncrawl-appstore-url` can
+carry the 10k target. Early terminal yield was much lower than Apple-search
+rows, with failures dominated by 404 and weak policy signal. Treat it as a
+long-tail source until its failure modes are repaired. The Apple-search broad
+batch consumes all active `apple-search:*` rows across storefronts first because
+observed terminal success was above 90% for the active travel/video slices.
+
+Useful status commands:
+
+```bash
+python scripts\queue_store.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  stats
+
+python scripts\summarize_commoncrawl_progress.py \
+  --progress-jsonl F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\wave1-us-gb-jp-de-fr-cn-in-2char.progress.jsonl \
+  --total-shards 4732 \
+  --output-json F:\ios-privacy-policy-collector\data\commoncrawl-prefix-bg\wave1-us-gb-jp-de-fr-cn-in-2char.progress-summary.json
+```
+
+If a stopped batch leaves stale `running` rows, requeue by worker prefix:
+
+```bash
+python scripts\queue_store.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  requeue-running \
+  --worker-prefix cluster-batch5-apple-search-es-it-nl
+```
+
+For targeted repair after a collector bug or domain-rule fix, requeue and retry
+one failed fetch without disturbing the rest of the batch:
+
+```bash
+python scripts\queue_store.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  requeue-fetch \
+  --fetch-id 42780
+
+python scripts\queue_worker.py \
+  --db F:\ios-privacy-policy-collector\data\queue.sqlite \
+  --worker-id retry-42780 \
+  --fetch-id 42780 \
+  --limit 1 \
+  --output-dir F:\ios-privacy-policy-collector\data\policy-clusters \
+  --jsonl F:\ios-privacy-policy-collector\data\policy-batch-bg\retry-42780.jsonl \
+  --proxy http://127.0.0.1:7890 \
+  --try-common-paths \
+  --enrich-lookup \
+  --collect-cluster \
+  --cluster-probe-common-paths \
+  --js-fallback
+```
 
 ## Tests
 

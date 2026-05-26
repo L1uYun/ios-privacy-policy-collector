@@ -1,10 +1,13 @@
 import importlib.util
 import argparse
+import http.client
+import io
 import json
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT_PATH = (
@@ -100,6 +103,53 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         self.assertEqual(result.url, "https://developer.example.cn/legal/privacy")
         self.assertEqual(result.method, "anchor")
 
+    def test_ignores_apple_internet_services_platform_policy_page(self):
+        html = """
+        <main>
+          <a href="https://www.apple.com.cn/legal/internet-services">隐私政策</a>
+          <a href="https://developer.example.cn/privacy-policy">开发者隐私政策</a>
+        </main>
+        """
+
+        result = self.collector.extract_privacy_policy_url(
+            html,
+            "https://apps.apple.com/cn/app/example/id1234567890",
+        )
+
+        self.assertEqual(result.url, "https://developer.example.cn/privacy-policy")
+        self.assertEqual(result.method, "anchor")
+
+    def test_returns_none_when_only_apple_platform_policy_links_exist(self):
+        html = """
+        <main>
+          <a href="https://www.apple.com.cn/legal/internet-services">隐私政策</a>
+          <a href="https://apps.apple.com/cn/app/example/id1234567890">App Store</a>
+        </main>
+        """
+
+        result = self.collector.extract_privacy_policy_url(
+            html,
+            "https://apps.apple.com/cn/app/example/id1234567890",
+        )
+
+        self.assertIsNone(result)
+
+    def test_ignores_country_specific_apple_legal_privacy_page(self):
+        html = """
+        <main>
+          <a href="https://www.apple.fr/fr/legal/privacy/">Apple Inc.</a>
+          <a href="https://developer.example.fr/confidentialite">Developer Privacy Policy</a>
+        </main>
+        """
+
+        result = self.collector.extract_privacy_policy_url(
+            html,
+            "https://apps.apple.com/fr/app/example/id1234567890",
+        )
+
+        self.assertEqual(result.url, "https://developer.example.fr/confidentialite")
+        self.assertEqual(result.method, "anchor")
+
     def test_extracts_plain_text_privacy_policy_url_from_description(self):
         html = """
         <section>
@@ -191,6 +241,59 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         self.assertIn(method, {"markdownify", "internal"})
         self.assertEqual(links[0]["url"], "https://example.com/cookies")
 
+    def test_detects_pdf_policy_response_from_magic_bytes(self):
+        self.assertTrue(
+            self.collector.is_pdf_response(
+                b"%PDF-1.7\n...",
+                "application/octet-stream",
+                "https://example.com/privacy",
+            )
+        )
+
+    def test_detects_binary_policy_response(self):
+        self.assertTrue(self.collector.looks_like_binary(b"\x00\x01\x02\x03" * 40, "application/octet-stream"))
+        self.assertFalse(self.collector.looks_like_binary(b"<html><body>Privacy Policy</body></html>", "text/html"))
+
+    def test_extracts_pdf_text_as_markdown(self):
+        try:
+            from pypdf import PdfWriter
+        except ImportError:
+            self.skipTest("pypdf is not installed")
+
+        buffer = io.BytesIO()
+        writer = PdfWriter()
+        writer.add_blank_page(width=72, height=72)
+        writer.add_metadata({"/Title": "Privacy Policy"})
+        writer.write(buffer)
+
+        with mock.patch("pypdf._page.PageObject.extract_text", return_value="Privacy Policy\nPersonal information"):
+            markdown = self.collector.extract_pdf_text(buffer.getvalue(), "https://example.com/privacy.pdf")
+
+        self.assertTrue(markdown.startswith("# privacy.pdf"))
+        self.assertIn("Personal information", markdown)
+
+    def test_ensure_markdown_complete_falls_back_to_text_and_source_link(self):
+        markdown, method, links = self.collector.ensure_markdown_complete(
+            "Privacy",
+            "Privacy Policy. We process personal information for account services.",
+            "https://example.com/privacy",
+            50,
+        )
+
+        self.assertEqual(method, "text-fallback")
+        self.assertIn("[https://example.com/privacy](https://example.com/privacy)", markdown)
+        self.assertIn("personal information", markdown)
+        self.assertEqual(links[0]["url"], "https://example.com/privacy")
+
+    def test_ensure_source_link_adds_policy_url_once(self):
+        links = [{"text": "Cookie Policy", "url": "https://example.com/cookies"}]
+
+        updated = self.collector.ensure_source_link(links, "https://example.com/privacy")
+        unchanged = self.collector.ensure_source_link(updated, "https://example.com/privacy")
+
+        self.assertEqual(updated[0]["url"], "https://example.com/privacy")
+        self.assertEqual(sum(1 for link in unchanged if link["url"] == "https://example.com/privacy"), 1)
+
     def test_generates_common_privacy_url_candidates(self):
         candidates = self.collector.common_privacy_url_candidates(
             "https://developer.example.com/apps/product?ref=store"
@@ -202,6 +305,118 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         self.assertIn("https://developer.example.com/policies/privacy-policy", candidates)
         self.assertIn("https://developer.example.com/privacy-center", candidates)
         self.assertIn("https://developer.example.com/legal/terms-of-use", candidates)
+
+    def test_sitemap_policy_candidates_rank_privacy_urls(self):
+        sitemap = """
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url><loc>https://example.com/blog</loc></url>
+          <url><loc>https://example.com/legal/privacy-policy</loc></url>
+          <url><loc>https://example.com/terms</loc></url>
+        </urlset>
+        """
+
+        def fake_request_text(url, timeout, user_agent, proxy=None, retries=0):
+            self.assertEqual(url, "https://example.com/sitemap.xml")
+            return sitemap
+
+        original_request_text = self.collector.request_text
+        try:
+            self.collector.request_text = fake_request_text
+            candidates = self.collector.sitemap_policy_candidates(
+                "https://example.com/app",
+                10,
+                "agent",
+            )
+        finally:
+            self.collector.request_text = original_request_text
+
+        self.assertEqual(candidates[0]["url"], "https://example.com/legal/privacy-policy")
+        self.assertEqual(candidates[0]["source"], "sitemap")
+
+    def test_robots_sitemap_policy_candidates_use_declared_sitemaps(self):
+        robots = "User-agent: *\nSitemap: https://example.com/custom-sitemap.xml\n"
+        sitemap = """
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url><loc>https://example.com/privacy</loc></url>
+        </urlset>
+        """
+
+        def fake_request_text(url, timeout, user_agent, proxy=None, retries=0):
+            return { "https://example.com/robots.txt": robots, "https://example.com/custom-sitemap.xml": sitemap }[url]
+
+        original_request_text = self.collector.request_text
+        try:
+            self.collector.request_text = fake_request_text
+            candidates = self.collector.robots_sitemap_policy_candidates(
+                "https://example.com/app",
+                10,
+                "agent",
+            )
+        finally:
+            self.collector.request_text = original_request_text
+
+        self.assertEqual(candidates[0]["url"], "https://example.com/privacy")
+        self.assertEqual(candidates[0]["source"], "robots-sitemap")
+
+    def test_shortlink_candidate_expands_final_url(self):
+        def fake_request_final_url(url, timeout, user_agent, proxy=None):
+            self.assertEqual(url, "https://on.fb.me/example")
+            return "https://developer.example.com/privacy"
+
+        original_request_final_url = self.collector.request_final_url
+        try:
+            self.collector.request_final_url = fake_request_final_url
+            candidate = self.collector.expand_shortlink_candidate("https://on.fb.me/example", 10, "agent")
+        finally:
+            self.collector.request_final_url = original_request_final_url
+
+        self.assertEqual(candidate["url"], "https://developer.example.com/privacy")
+        self.assertEqual(candidate["source"], "shortlink-expand")
+
+    def test_extracts_app_store_external_links_for_missing_seller_url_fallback(self):
+        html = """
+        <main>
+          <a href="https://apps.apple.com/us/story/id1538632801">App Privacy</a>
+          <a href="https://developer.example.com/app">Developer Website</a>
+          <a href="https://support.example.com/app">App Support</a>
+        </main>
+        """
+
+        candidates = self.collector.extract_app_store_external_links(
+            html,
+            "https://apps.apple.com/us/app/example/id1234567890",
+        )
+
+        self.assertEqual(candidates[0]["url"], "https://developer.example.com/app")
+        self.assertEqual(candidates[0]["source"], "app-store-external-link")
+        self.assertEqual(candidates[1]["url"], "https://support.example.com/app")
+
+    def test_seller_home_policy_candidates_can_use_js_rendering(self):
+        def fake_request_text(url, timeout, user_agent, proxy=None):
+            return "<html><body><div id='app'>Loading</div></body></html>"
+
+        def fake_render(url, timeout, user_agent, proxy=None, wait_ms=0):
+            return """
+            <html><body>
+              <a href="/legal/privacy">Privacy Policy</a>
+            </body></html>
+            """
+
+        original_request_text = self.collector.request_text
+        try:
+            self.collector.request_text = fake_request_text
+            candidates = self.collector.seller_home_policy_candidates(
+                "https://example.com",
+                10,
+                "agent",
+                render_text=fake_render,
+                js_fallback=True,
+            )
+        finally:
+            self.collector.request_text = original_request_text
+
+        self.assertEqual(candidates[0]["url"], "https://example.com/legal/privacy")
+        self.assertEqual(candidates[0]["source"], "seller-home-js:anchor")
 
     def test_fallback_policy_urls_skip_app_store_origin(self):
         record = self.collector.AppRecord(
@@ -310,6 +525,34 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         self.assertEqual(row["policy_fetch_method"], "js")
         self.assertIn("Terms of Service", markdown)
 
+    def test_fetch_policy_candidate_refuses_apple_platform_url(self):
+        record = self.collector.AppRecord(
+            app_id="1234567890",
+            name="Example App",
+            bundle_id=None,
+            seller_name="Example Inc.",
+            app_store_url="https://apps.apple.com/us/app/example/id1234567890",
+            seller_url="https://example.com",
+            source="test",
+            raw={},
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(
+                timeout=10,
+                user_agent="test-agent",
+                proxy=None,
+                min_policy_chars=50,
+            )
+            with self.assertRaises(ValueError):
+                self.collector.fetch_policy_candidate(
+                    "https://www.apple.com.cn/legal/internet-services",
+                    record,
+                    args,
+                    pathlib.Path(tmpdir),
+                    "",
+                )
+
     def test_collect_app_continues_after_candidate_js_timeout(self):
         record = self.collector.AppRecord(
             app_id="1234567890",
@@ -414,6 +657,82 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         self.assertEqual(records[0].app_id, "1234567890")
         self.assertEqual(records[0].seller_name, "Example Inc.")
         self.assertEqual(records[0].app_store_url, "https://apps.apple.com/us/app/example/id1234567890")
+
+    def test_request_text_retries_incomplete_chunked_response(self):
+        class FakeResponse:
+            headers = mock.Mock()
+
+            def __init__(self, body=None, exc=None):
+                self.body = body
+                self.exc = exc
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                if self.exc:
+                    raise self.exc
+                return self.body
+
+        FakeResponse.headers.get_content_charset.return_value = "utf-8"
+        opener = mock.Mock()
+        opener.open.side_effect = [
+            FakeResponse(exc=http.client.IncompleteRead(b'{"partial":')),
+            FakeResponse(body=b'{"ok": true}'),
+        ]
+
+        with mock.patch.object(self.collector, "build_opener", return_value=opener), mock.patch.object(self.collector.time, "sleep"):
+            text = self.collector.request_text("https://example.test/feed", 10, "agent", retries=1)
+
+        self.assertEqual(text, '{"ok": true}')
+        self.assertEqual(opener.open.call_count, 2)
+
+    def test_request_text_falls_back_on_invalid_charset(self):
+        class FakeResponse:
+            headers = mock.Mock()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return "privacy policy".encode("utf-8")
+
+        FakeResponse.headers.get_content_charset.return_value = "utf-8,gbk"
+        opener = mock.Mock()
+        opener.open.return_value = FakeResponse()
+
+        with mock.patch.object(self.collector, "build_opener", return_value=opener):
+            text = self.collector.request_text("https://example.test/privacy", 10, "agent")
+
+        self.assertEqual(text, "privacy policy")
+
+    def test_request_text_falls_back_when_charset_parser_raises(self):
+        class FakeResponse:
+            headers = mock.Mock()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"resultCount": 1}'
+
+        FakeResponse.headers.get_content_charset.side_effect = LookupError("unknown encoding: utf-8,gbk")
+        opener = mock.Mock()
+        opener.open.return_value = FakeResponse()
+
+        with mock.patch.object(self.collector, "build_opener", return_value=opener):
+            text = self.collector.request_text("https://itunes.apple.com/lookup?id=1", 10, "agent")
+
+        self.assertEqual(text, '{"resultCount": 1}')
 
     def test_completed_keys_only_include_successful_rows(self):
         rows = [

@@ -13,9 +13,12 @@ as the policy text itself.
 from __future__ import annotations
 
 import argparse
+import codecs
 import dataclasses
 import hashlib
 import html
+import http.client
+import io
 import json
 import os
 import re
@@ -24,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -45,11 +49,29 @@ PRIVACY_JSON_FIELD_RE = re.compile(
     r'"(?P<key>privacyPolicyUrl|privacyPolicyURL|privacyUrl|privacyURL)"\s*:\s*"(?P<url>(?:\\.|[^"\\])*)"',
     re.IGNORECASE,
 )
+APP_STORE_EXTERNAL_JSON_FIELD_RE = re.compile(
+    r'"(?P<key>developerWebsite|developerWebsiteUrl|appSupport|appSupportUrl|websiteUrl|sellerWebsiteUrl)"\s*:\s*"(?P<url>(?:\\.|[^"\\])*)"',
+    re.IGNORECASE,
+)
 APP_ID_RE = re.compile(r"(?:^|[/\?&])id(?P<id>\d{5,})(?:[/?&#]|$)")
 NUMERIC_ID_RE = re.compile(r"^\d{5,}$")
 ID_PREFIX_RE = re.compile(r"^id(?P<id>\d{5,})$")
 TEXT_URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+", re.IGNORECASE)
 PRIVACY_CONTEXT_RE = re.compile(r"privacy(?:\s+policy)?", re.IGNORECASE)
+SHORTLINK_HOSTS = {
+    "bit.ly",
+    "buff.ly",
+    "cutt.ly",
+    "goo.gl",
+    "is.gd",
+    "lnkd.in",
+    "on.fb.me",
+    "ow.ly",
+    "rebrand.ly",
+    "t.co",
+    "tiny.cc",
+    "tinyurl.com",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,6 +91,10 @@ class PrivacyUrlResult:
     url: str
     method: str
     evidence: str | None = None
+
+
+class UnsupportedDocumentError(RuntimeError):
+    """Raised when a policy URL returns content we cannot archive as text."""
 
 
 class LinkExtractor(HTMLParser):
@@ -241,8 +267,8 @@ def parse_app_id(value: str) -> str | None:
     return None
 
 
-def request_json_with_proxy(url: str, timeout: int, user_agent: str, proxy: str | None) -> dict:
-    text = request_text(url, timeout=timeout, user_agent=user_agent, proxy=proxy)
+def request_json_with_proxy(url: str, timeout: int, user_agent: str, proxy: str | None, retries: int = 2) -> dict:
+    text = request_text(url, timeout=timeout, user_agent=user_agent, proxy=proxy, retries=retries)
     return json.loads(text)
 
 
@@ -252,7 +278,63 @@ def build_opener(proxy: str | None) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
 
 
-def request_text(url: str, timeout: int, user_agent: str, proxy: str | None = None) -> str:
+def is_pdf_response(content: bytes, content_type: str | None, url: str) -> bool:
+    lower_type = content_type.lower() if isinstance(content_type, str) else ""
+    lower_path = urllib.parse.urlparse(url).path.lower()
+    return "application/pdf" in lower_type or content.lstrip().startswith(b"%PDF-") or lower_path.endswith(".pdf")
+
+
+def looks_like_binary(content: bytes, content_type: str | None) -> bool:
+    lower_type = content_type.lower() if isinstance(content_type, str) else ""
+    if lower_type.startswith(("text/", "application/json", "application/xml", "application/xhtml+xml")):
+        return False
+    if b"\x00" in content[:4096]:
+        return True
+    sample = content[:4096]
+    if not sample:
+        return False
+    control = sum(1 for byte in sample if byte < 9 or (13 < byte < 32))
+    return control / len(sample) > 0.15
+
+
+def extract_pdf_text(content: bytes, url: str) -> str:
+    errors: list[str] = []
+    text = ""
+    try:
+        from pypdf import PdfReader  # type: ignore
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            page_texts = [(page.extract_text() or "").strip() for page in reader.pages]
+            text = "\n\n".join(page for page in page_texts if page).strip()
+        except Exception as exc:
+            errors.append(f"pypdf: {exc}")
+    except ImportError:
+        errors.append("pypdf: not installed")
+
+    if not text:
+        try:
+            import fitz  # type: ignore
+
+            with fitz.open(stream=content, filetype="pdf") as document:
+                page_texts = [page.get_text("text").strip() for page in document]
+            text = "\n\n".join(page for page in page_texts if page).strip()
+        except Exception as exc:
+            errors.append(f"pymupdf: {exc}")
+
+    if not text:
+        raise UnsupportedDocumentError("PDF policy did not contain extractable text; " + "; ".join(errors))
+    title = Path(urllib.parse.urlparse(url).path).name or "privacy-policy.pdf"
+    return f"# {title}\n\n{text}\n"
+
+
+def request_text(
+    url: str,
+    timeout: int,
+    user_agent: str,
+    proxy: str | None = None,
+    retries: int = 2,
+    retry_sleep: float = 1.0,
+) -> str:
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -261,9 +343,68 @@ def request_text(url: str, timeout: int, user_agent: str, proxy: str | None = No
     }
     request = urllib.request.Request(url, headers=headers)
     opener = build_opener(proxy)
-    with opener.open(request, timeout=timeout) as response:
-        content_type = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(content_type, "replace")
+    retryable_exceptions = (
+        http.client.IncompleteRead,
+        http.client.RemoteDisconnected,
+        TimeoutError,
+        urllib.error.URLError,
+    )
+    last_exc: BaseException | None = None
+    for attempt in range(retries + 1):
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                content = response.read()
+                content_type = response.headers.get("Content-Type")
+                final_url = response.geturl() if hasattr(response, "geturl") else url
+                if is_pdf_response(content, content_type, final_url):
+                    return extract_pdf_text(content, final_url)
+                if looks_like_binary(content, content_type):
+                    raise UnsupportedDocumentError(f"unsupported binary policy response: content-type={content_type or 'unknown'}")
+                try:
+                    charset = response.headers.get_content_charset() or "utf-8"
+                except LookupError:
+                    charset = "utf-8"
+                try:
+                    codecs.lookup(charset)
+                except LookupError:
+                    charset = "utf-8"
+                return content.decode(charset, "replace")
+        except retryable_exceptions as exc:
+            last_exc = exc
+            if attempt >= retries:
+                raise
+            if retry_sleep:
+                time.sleep(retry_sleep * (attempt + 1))
+    raise RuntimeError(f"request failed without response: {last_exc}")
+
+
+def request_final_url(
+    url: str,
+    timeout: int,
+    user_agent: str,
+    proxy: str | None = None,
+    retries: int = 1,
+    retry_sleep: float = 0.5,
+) -> str:
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    opener = build_opener(proxy)
+    last_exc: BaseException | None = None
+    for attempt in range(retries + 1):
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                return response.geturl() if hasattr(response, "geturl") else url
+        except (http.client.RemoteDisconnected, TimeoutError, urllib.error.URLError) as exc:
+            last_exc = exc
+            if attempt >= retries:
+                raise
+            if retry_sleep:
+                time.sleep(retry_sleep * (attempt + 1))
+    raise RuntimeError(f"final URL request failed without response: {last_exc}")
 
 
 def render_text_with_playwright(
@@ -422,11 +563,29 @@ def normalize_url(url: str, base_url: str) -> str:
     return urllib.parse.urljoin(base_url, url)
 
 
+def is_apple_platform_policy_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname.lower() if parsed.hostname else ""
+    path = parsed.path.lower()
+    if not host:
+        return False
+    if host == "apps.apple.com" or host.endswith(".apps.apple.com"):
+        return True
+    if re.fullmatch(r"(?:www\.)?apple\.[a-z.]+", host) and (
+        "/legal/" in path
+        or "/privacy/" in path
+        or path.rstrip("/").endswith("/privacy")
+        or path.rstrip("/").endswith("/cookies")
+    ):
+        return True
+    return False
+
+
 def is_apple_privacy_label_url(url: str) -> bool:
     parsed = urllib.parse.urlparse(url)
-    host = parsed.netloc.lower()
+    host = parsed.hostname.lower() if parsed.hostname else ""
     path = parsed.path.lower()
-    if host.endswith("apps.apple.com") and (
+    if (host == "apps.apple.com" or host.endswith(".apps.apple.com")) and (
         "/story/" in path
         or "/privacy/" in path
         or "app-privacy" in path
@@ -464,7 +623,7 @@ def privacy_link_score(link: dict[str, str], base_url: str) -> int:
         score += 10
     if "legal" in haystack:
         score += 5
-    if is_apple_privacy_label_url(url):
+    if is_apple_platform_policy_url(url):
         score -= 100
     if urllib.parse.urlparse(url).scheme not in {"http", "https"}:
         score -= 100
@@ -474,7 +633,7 @@ def privacy_link_score(link: dict[str, str], base_url: str) -> int:
 def extract_privacy_policy_url(html_text: str, base_url: str) -> PrivacyUrlResult | None:
     for match in PRIVACY_JSON_FIELD_RE.finditer(html_text):
         url = normalize_url(decode_json_string(match.group("url")), base_url)
-        if url and not is_apple_privacy_label_url(url):
+        if url and not is_apple_platform_policy_url(url):
             return PrivacyUrlResult(url=url, method="json-field", evidence=match.group("key"))
 
     parser = LinkExtractor()
@@ -501,7 +660,7 @@ def extract_text_privacy_policy_url(html_text: str, base_url: str) -> PrivacyUrl
     best: tuple[int, str, str] | None = None
     for match in matches:
         url = normalize_url(match.group(0).rstrip(".,;:"), base_url)
-        if is_apple_privacy_label_url(url):
+        if is_apple_platform_policy_url(url):
             continue
         start = max(0, match.start() - 80)
         end = min(len(readable), match.end() + 80)
@@ -520,6 +679,83 @@ def extract_text_privacy_policy_url(html_text: str, base_url: str) -> PrivacyUrl
     if best is None:
         return None
     return PrivacyUrlResult(url=best[1], method="text-url", evidence=best[2])
+
+
+def app_store_external_link_score(link: dict[str, str], base_url: str) -> int:
+    url = normalize_url(link["href"], base_url)
+    if is_apple_platform_policy_url(url):
+        return -100
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return -100
+    host = (parsed.hostname or "").lower()
+    if host.endswith("apple.com") or host.endswith("apple.com.cn"):
+        return -100
+    haystack = " ".join(
+        [
+            url.lower(),
+            link.get("text", "").lower(),
+            link.get("aria-label", "").lower(),
+            link.get("class", "").lower(),
+        ]
+    )
+    score = 0
+    if "developer website" in haystack or "developer" in haystack:
+        score += 50
+    if "app support" in haystack or "support" in haystack:
+        score += 40
+    if "website" in haystack:
+        score += 20
+    if "privacy" in haystack:
+        score += 30
+    if privacy_candidate_score_url(url) > 0:
+        score += 20
+    if parsed.netloc:
+        score += 5
+    return score
+
+
+def extract_app_store_external_links(html_text: str, base_url: str, limit: int = 5) -> list[dict]:
+    def add_candidate(candidates: list[dict], seen: set[str], url: str, source: str, evidence: str, score: int) -> None:
+        if not url or url in seen:
+            return
+        if is_apple_platform_policy_url(url):
+            return
+        seen.add(url)
+        candidates.append(
+            {
+                "url": url,
+                "source": source,
+                "browser_first": False,
+                "evidence": evidence,
+                "score": str(score),
+            }
+        )
+
+    candidates: list[dict] = []
+    seen: set[str] = set()
+
+    for match in APP_STORE_EXTERNAL_JSON_FIELD_RE.finditer(html_text):
+        url = normalize_url(decode_json_string(match.group("url")), base_url)
+        score = 100 if match.group("key").lower().startswith("developer") else 80
+        add_candidate(candidates, seen, url, "app-store-external-json", match.group("key"), score)
+        if len(candidates) >= limit:
+            return candidates
+
+    parser = LinkExtractor()
+    parser.feed(html_text)
+    scored = []
+    for link in parser.links:
+        score = app_store_external_link_score(link, base_url)
+        if score <= 0:
+            continue
+        scored.append((score, normalize_url(link["href"], base_url), link))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    for score, url, link in scored:
+        add_candidate(candidates, seen, url, "app-store-external-link", (link.get("text") or link.get("aria-label") or link.get("href")).strip(), score)
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def extract_app_privacy_label_text(html_text: str) -> str:
@@ -603,6 +839,22 @@ def best_markdown_and_links(html_text: str, base_url: str) -> tuple[str, str, li
     return internal_markdown, "internal", internal_links
 
 
+def fallback_text_markdown(text: str, source_url: str) -> str:
+    return f"# Privacy Policy\n\nSource: [{source_url}]({source_url})\n\n{text.strip()}\n"
+
+
+def ensure_markdown_complete(markdown: str, text: str, source_url: str, min_chars: int) -> tuple[str, str, list[dict[str, str]]]:
+    if len(markdown.strip()) >= min_chars or len(text.strip()) < min_chars:
+        return markdown, "", []
+    return fallback_text_markdown(text, source_url), "text-fallback", [{"text": source_url, "url": source_url}]
+
+
+def ensure_source_link(links: list[dict[str, str]], source_url: str) -> list[dict[str, str]]:
+    if any(link.get("url") == source_url for link in links):
+        return links
+    return [{"text": source_url, "url": source_url}, *links]
+
+
 def common_privacy_url_candidates(base_url: str) -> list[str]:
     parsed = urllib.parse.urlparse(base_url)
     if not parsed.scheme or not parsed.netloc:
@@ -638,6 +890,191 @@ def common_privacy_url_candidates(base_url: str) -> list[str]:
         "/policies/terms-of-service",
     ]
     return [origin + path for path in paths]
+
+
+def origin_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def is_shortlink_url(url: str) -> bool:
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    return host in SHORTLINK_HOSTS
+
+
+def expand_shortlink_candidate(
+    url: str,
+    timeout: int,
+    user_agent: str,
+    proxy: str | None = None,
+) -> dict | None:
+    if not is_shortlink_url(url):
+        return None
+    final_url = request_final_url(url, timeout=timeout, user_agent=user_agent, proxy=proxy)
+    if final_url and final_url != url and urllib.parse.urlparse(final_url).scheme in {"http", "https"}:
+        return candidate_dict(final_url, "shortlink-expand", False)
+    return None
+
+
+def sitemap_urls_from_xml(xml_text: str, base_url: str, max_urls: int = 100) -> list[str]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    urls: list[str] = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1].lower() != "loc" or not element.text:
+            continue
+        url = normalize_url(element.text.strip(), base_url)
+        if url:
+            urls.append(url)
+        if len(urls) >= max_urls:
+            break
+    return urls
+
+
+def privacy_candidate_score_url(url: str) -> int:
+    lower = url.lower()
+    score = 0
+    for token, value in [
+        ("privacy-policy", 80),
+        ("privacy_policy", 80),
+        ("privacy-notice", 75),
+        ("privacy/notice", 75),
+        ("privacy", 50),
+        ("datenschutz", 50),
+        ("privacidad", 50),
+        ("legal", 15),
+        ("policy", 10),
+    ]:
+        if token in lower:
+            score += value
+    for token in ["/tag/", "/category/", "/author/", "/feed", ".jpg", ".png", ".css", ".js"]:
+        if token in lower:
+            score -= 80
+    return score
+
+
+def sitemap_policy_candidates(
+    base_url: str,
+    timeout: int,
+    user_agent: str,
+    proxy: str | None = None,
+    max_sitemaps: int = 3,
+    max_urls: int = 80,
+) -> list[dict]:
+    origin = origin_from_url(base_url)
+    if not origin:
+        return []
+    sitemap_urls = [origin + "/sitemap.xml", origin + "/sitemap_index.xml"]
+    candidates: list[dict] = []
+    seen_sitemaps: set[str] = set()
+    seen_candidates: set[str] = set()
+    for sitemap_url in sitemap_urls:
+        if sitemap_url in seen_sitemaps or len(seen_sitemaps) >= max_sitemaps:
+            continue
+        seen_sitemaps.add(sitemap_url)
+        try:
+            xml_text = request_text(sitemap_url, timeout, user_agent, proxy=proxy, retries=0)
+        except Exception:
+            continue
+        locs = sitemap_urls_from_xml(xml_text, sitemap_url, max_urls=max_urls)
+        nested = [url for url in locs if "sitemap" in url.lower()][: max_sitemaps - len(seen_sitemaps)]
+        for nested_url in nested:
+            if nested_url in seen_sitemaps or len(seen_sitemaps) >= max_sitemaps:
+                continue
+            seen_sitemaps.add(nested_url)
+            try:
+                nested_xml = request_text(nested_url, timeout, user_agent, proxy=proxy, retries=0)
+            except Exception:
+                continue
+            locs.extend(sitemap_urls_from_xml(nested_xml, nested_url, max_urls=max_urls))
+        scored = sorted(((privacy_candidate_score_url(url), url) for url in locs), reverse=True)
+        for score, url in scored:
+            if score <= 0 or url in seen_candidates or is_apple_platform_policy_url(url):
+                continue
+            seen_candidates.add(url)
+            candidates.append(candidate_dict(url, "sitemap", False))
+    return candidates
+
+
+def robots_sitemap_policy_candidates(
+    base_url: str,
+    timeout: int,
+    user_agent: str,
+    proxy: str | None = None,
+    max_sitemaps: int = 4,
+) -> list[dict]:
+    origin = origin_from_url(base_url)
+    if not origin:
+        return []
+    try:
+        robots_text = request_text(origin + "/robots.txt", timeout, user_agent, proxy=proxy, retries=0)
+    except Exception:
+        return []
+    sitemap_urls = []
+    for line in robots_text.splitlines():
+        if line.lower().startswith("sitemap:"):
+            sitemap_urls.append(line.split(":", 1)[1].strip())
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for sitemap_url in sitemap_urls[:max_sitemaps]:
+        try:
+            xml_text = request_text(sitemap_url, timeout, user_agent, proxy=proxy, retries=0)
+        except Exception:
+            continue
+        scored = sorted(
+            ((privacy_candidate_score_url(url), url) for url in sitemap_urls_from_xml(xml_text, sitemap_url)),
+            reverse=True,
+        )
+        for score, url in scored:
+            if score <= 0 or url in seen or is_apple_platform_policy_url(url):
+                continue
+            seen.add(url)
+            candidates.append(candidate_dict(url, "robots-sitemap", False))
+    return candidates
+
+
+def seller_home_policy_candidates(
+    seller_url: str,
+    timeout: int,
+    user_agent: str,
+    proxy: str | None = None,
+    render_text=None,
+    js_fallback: bool = False,
+    js_timeout: int | None = None,
+    js_wait_ms: int = 2000,
+) -> list[dict]:
+    if not seller_url:
+        return []
+    candidates: list[dict] = []
+    try:
+        html_text = request_text(seller_url, timeout, user_agent, proxy=proxy)
+    except Exception:
+        html_text = ""
+    if html_text:
+        result = extract_privacy_policy_url(html_text, seller_url)
+        if result and not is_apple_platform_policy_url(result.url):
+            candidates.append(candidate_dict(result.url, f"seller-home:{result.method}", False))
+    if js_fallback and not candidates:
+        renderer = render_text or render_text_with_playwright
+        try:
+            rendered_html = renderer(
+                seller_url,
+                js_timeout or timeout,
+                DEFAULT_BROWSER_USER_AGENT,
+                proxy=proxy,
+                wait_ms=js_wait_ms,
+            )
+        except Exception:
+            rendered_html = ""
+        if rendered_html:
+            result = extract_privacy_policy_url(rendered_html, seller_url)
+            if result and not is_apple_platform_policy_url(result.url):
+                candidates.append(candidate_dict(result.url, f"seller-home-js:{result.method}", False))
+    return candidates
 
 
 def default_domain_rules_path() -> Path:
@@ -898,6 +1335,8 @@ def fetch_policy_candidate(
         "error_class": None,
         "error_message": None,
     }
+    if is_apple_platform_policy_url(policy_url):
+        raise ValueError(f"refusing Apple platform policy URL: {policy_url}")
     if browser_first:
         render_text = getattr(args, "render_text", render_text_with_playwright)
         policy_html = render_text(
@@ -914,6 +1353,17 @@ def fetch_policy_candidate(
     policy_text = html_to_text(policy_html)
     policy_markdown, markdown_method, policy_links = best_markdown_and_links(policy_html, policy_url)
     quality, quality_reason = policy_text_quality(policy_text, args.min_policy_chars)
+    fallback_markdown, fallback_method, fallback_links = ensure_markdown_complete(
+        policy_markdown,
+        policy_text,
+        policy_url,
+        args.min_policy_chars,
+    )
+    if fallback_method:
+        policy_markdown = fallback_markdown
+        markdown_method = fallback_method
+        policy_links = fallback_links + policy_links
+    policy_links = ensure_source_link(policy_links, policy_url)
     if getattr(args, "js_fallback", False) and quality in {"too_short", "possibly_blocked"}:
         render_text = getattr(args, "render_text", render_text_with_playwright)
         rendered_html = render_text(
@@ -932,6 +1382,17 @@ def fetch_policy_candidate(
             quality = rendered_quality
             quality_reason = rendered_quality_reason
             fetch_method = "js"
+    fallback_markdown, fallback_method, fallback_links = ensure_markdown_complete(
+        policy_markdown,
+        policy_text,
+        policy_url,
+        args.min_policy_chars,
+    )
+    if fallback_method:
+        policy_markdown = fallback_markdown
+        markdown_method = fallback_method
+        policy_links = fallback_links + policy_links
+    policy_links = ensure_source_link(policy_links, policy_url)
     attempt.update(
         {
             "status": "accepted" if quality == "ok" else "rejected",
@@ -986,6 +1447,16 @@ def fallback_policy_urls(record: AppRecord, primary_url: str | None) -> Iterator
 
 def candidate_dict(url: str, source: str, browser_first: bool = False) -> dict:
     return {"url": url, "source": source, "browser_first": browser_first}
+
+
+def append_policy_candidate(candidates: list[dict], seen: set[str], candidate: dict | None) -> None:
+    if not candidate:
+        return
+    url = candidate.get("url")
+    if not url or url in seen or is_apple_platform_policy_url(url):
+        return
+    candidates.append(candidate)
+    seen.add(url)
 
 
 def collect_app(record: AppRecord, args: argparse.Namespace, country: str) -> dict:
@@ -1055,17 +1526,74 @@ def collect_app(record: AppRecord, args: argparse.Namespace, country: str) -> di
         candidate_urls: list[dict] = []
         seen_candidates: set[str] = set()
         for candidate in domain_rule_policy_candidates(record, getattr(args, "domain_rules", None)):
-            if candidate["url"] not in seen_candidates:
-                candidate_urls.append(candidate)
-                seen_candidates.add(candidate["url"])
+            append_policy_candidate(candidate_urls, seen_candidates, candidate)
         if privacy_result and privacy_result.url not in seen_candidates:
-            candidate_urls.append(candidate_dict(privacy_result.url, f"app-store:{privacy_result.method}", False))
-            seen_candidates.add(privacy_result.url)
+            append_policy_candidate(candidate_urls, seen_candidates, candidate_dict(privacy_result.url, f"app-store:{privacy_result.method}", False))
+        if args.try_common_paths and record.seller_url:
+            try:
+                append_policy_candidate(
+                    candidate_urls,
+                    seen_candidates,
+                    expand_shortlink_candidate(record.seller_url, args.fallback_timeout, args.user_agent, args.proxy),
+                )
+            except Exception as exc:
+                candidate_errors.append(f"{record.seller_url}: shortlink-expand: {type(exc).__name__}: {exc}")
+            for seller_candidate in seller_home_policy_candidates(
+                record.seller_url,
+                args.fallback_timeout,
+                args.user_agent,
+                proxy=args.proxy,
+                render_text=getattr(args, "render_text", render_text_with_playwright),
+                js_fallback=bool(getattr(args, "js_fallback", False)),
+                js_timeout=getattr(args, "js_timeout", args.timeout),
+                js_wait_ms=getattr(args, "js_wait_ms", 2000),
+            ):
+                append_policy_candidate(candidate_urls, seen_candidates, seller_candidate)
+        if args.try_common_paths:
+            for external_link in extract_app_store_external_links(app_html, record.app_store_url):
+                external_url = external_link["url"]
+                try:
+                    append_policy_candidate(
+                        candidate_urls,
+                        seen_candidates,
+                        expand_shortlink_candidate(external_url, args.fallback_timeout, args.user_agent, args.proxy),
+                    )
+                except Exception as exc:
+                    candidate_errors.append(f"{external_url}: app-store-external shortlink-expand: {type(exc).__name__}: {exc}")
+                for external_candidate in seller_home_policy_candidates(
+                    external_url,
+                    args.fallback_timeout,
+                    args.user_agent,
+                    proxy=args.proxy,
+                    render_text=getattr(args, "render_text", render_text_with_playwright),
+                    js_fallback=bool(getattr(args, "js_fallback", False)),
+                    js_timeout=getattr(args, "js_timeout", args.timeout),
+                    js_wait_ms=getattr(args, "js_wait_ms", 2000),
+                ):
+                    external_candidate = dict(external_candidate)
+                    external_candidate["source"] = f"app-store-external:{external_candidate['source']}"
+                    append_policy_candidate(candidate_urls, seen_candidates, external_candidate)
+                for fallback_url in fallback_policy_urls(
+                    dataclasses.replace(record, seller_url=external_url),
+                    privacy_result.url if privacy_result else None,
+                ):
+                    append_policy_candidate(candidate_urls, seen_candidates, candidate_dict(fallback_url, "app-store-external:common-path", False))
+                for candidate in robots_sitemap_policy_candidates(external_url, args.fallback_timeout, args.user_agent, proxy=args.proxy):
+                    candidate = dict(candidate)
+                    candidate["source"] = f"app-store-external:{candidate['source']}"
+                    append_policy_candidate(candidate_urls, seen_candidates, candidate)
+                for candidate in sitemap_policy_candidates(external_url, args.fallback_timeout, args.user_agent, proxy=args.proxy):
+                    candidate = dict(candidate)
+                    candidate["source"] = f"app-store-external:{candidate['source']}"
+                    append_policy_candidate(candidate_urls, seen_candidates, candidate)
         if args.try_common_paths:
             for fallback_url in fallback_policy_urls(record, privacy_result.url if privacy_result else None):
-                if fallback_url not in seen_candidates:
-                    candidate_urls.append(candidate_dict(fallback_url, "common-path", False))
-                    seen_candidates.add(fallback_url)
+                append_policy_candidate(candidate_urls, seen_candidates, candidate_dict(fallback_url, "common-path", False))
+            if record.seller_url:
+                for candidate in robots_sitemap_policy_candidates(record.seller_url, args.fallback_timeout, args.user_agent, proxy=args.proxy):
+                    append_policy_candidate(candidate_urls, seen_candidates, candidate)
+                for candidate in sitemap_policy_candidates(record.seller_url, args.fallback_timeout, args.user_agent, proxy=args.proxy):
+                    append_policy_candidate(candidate_urls, seen_candidates, candidate)
         if not candidate_urls:
             row["error"] = "privacy policy URL not found on App Store page"
             return row
