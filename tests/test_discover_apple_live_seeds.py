@@ -1,7 +1,10 @@
 import importlib.util
+import json
 import pathlib
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -25,6 +28,7 @@ class DiscoverAppleLiveSeedsTests(unittest.TestCase):
 
     def test_parse_csv(self):
         self.assertEqual(self.live.parse_csv("US, gb, ,JP"), ["us", "gb", "jp"])
+        self.assertEqual(self.live.parse_csv("none"), [])
 
     def test_app_record_to_seed(self):
         record = self.live.collector.AppRecord(
@@ -53,6 +57,58 @@ class DiscoverAppleLiveSeedsTests(unittest.TestCase):
         ]
 
         self.assertEqual(len(self.live.dedupe_rows(rows)), 2)
+
+    def test_load_completed_progress_tasks_uses_successful_events_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = pathlib.Path(tmpdir) / "progress.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"country": "us", "kind": "search", "value": "travel", "rows": 20}),
+                        json.dumps({"country": "gb", "kind": "chart", "value": "top-free", "rows": 0, "errors": 1}),
+                        "not-json",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            completed = self.live.load_completed_progress_tasks(path)
+
+        self.assertEqual(completed, {("us", "search", "travel")})
+
+    def test_incremental_import_runs_after_each_successful_task(self):
+        discovered_rows = [
+            {"seed_source": "apple-search:travel", "country": "us", "app_id": "1"},
+            {"seed_source": "apple-search:travel", "country": "us", "app_id": "1"},
+        ]
+        args = self.live.argparse.Namespace(
+            countries="us",
+            charts="none",
+            term=["travel"],
+            chart_limit=10,
+            search_limit=10,
+            timeout=1,
+            proxy=None,
+            user_agent="test",
+            sleep=0,
+            progress_every=0,
+            progress_jsonl=None,
+            resume_progress=False,
+            output_csv=None,
+            summary_json=None,
+            db="queue.sqlite",
+            incremental_import=True,
+        )
+
+        with mock.patch.object(self.live, "discover_search", return_value=discovered_rows), mock.patch.object(
+            self.live.queue_store, "import_seeds", return_value={"inserted": 1, "duplicates": 0}
+        ) as import_seeds:
+            summary = self.live.run(args)
+
+        import_seeds.assert_called_once()
+        imported_rows = import_seeds.call_args.args[1]
+        self.assertEqual(len(imported_rows), 1)
+        self.assertEqual(summary["db_import"], {"inserted": 1, "duplicates": 0, "mode": "incremental"})
 
 
 if __name__ == "__main__":

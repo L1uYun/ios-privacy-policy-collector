@@ -113,6 +113,7 @@ def try_extract_from_app_store(
     timeout: float,
     user_agent: str,
     proxy: str | None,
+    js_fallback: bool = True,
 ) -> tuple[str, str, str, str]:
     if not app_store_url:
         return "", "", "", ""
@@ -128,7 +129,7 @@ def try_extract_from_app_store(
             user_agent,
             proxy,
             max_paths=18,
-            js_fallback=True,
+            js_fallback=js_fallback,
         )
         if recovered_url:
             return recovered_url, f"app-store-external:{method}", link.get("evidence") or evidence, base_url
@@ -205,6 +206,68 @@ def discover_from_base_url(
     return "", "", ""
 
 
+def web_search_queries(app_id: str, app_name: str, country: str) -> list[str]:
+    clean_name = " ".join((app_name or "").replace("\u00a0", " ").split())
+    queries: list[str] = []
+    if clean_name:
+        queries.extend(
+            [
+                f'"{clean_name}" "{app_id}" privacy policy',
+                f'"{clean_name}" app privacy policy',
+                f'"{clean_name}" developer website',
+            ]
+        )
+    queries.append(f'"id{app_id}" privacy policy')
+    if country:
+        queries.append(f'"{app_id}" "{country}" privacy policy')
+    return queries
+
+
+def try_web_search_fallback(
+    app_id: str,
+    app_name: str,
+    country: str,
+    timeout: float,
+    user_agent: str,
+    proxy: str | None,
+    max_paths: int,
+    max_results: int,
+    js_fallback: bool = False,
+    search_endpoint: str = "https://html.duckduckgo.com/html/",
+) -> tuple[str, str, str, str]:
+    seen: set[str] = set()
+    for query in web_search_queries(app_id, app_name, country):
+        try:
+            candidates = collector.web_search_url_candidates(
+                query,
+                int(timeout),
+                user_agent,
+                proxy=proxy,
+                limit=max_results,
+                endpoint=search_endpoint,
+            )
+        except Exception:
+            continue
+        for candidate in candidates:
+            candidate_url = candidate.get("url", "")
+            if not candidate_url or candidate_url in seen or not is_acceptable_policy_url(candidate_url):
+                continue
+            seen.add(candidate_url)
+            if collector.privacy_candidate_score_url(candidate_url) > 0:
+                return candidate_url, "web-search:direct-policy-candidate", candidate.get("evidence", "") or query, candidate_url
+            recovered_url, method, evidence = discover_from_base_url(
+                candidate_url,
+                timeout,
+                user_agent,
+                proxy,
+                max_paths,
+                js_fallback,
+            )
+            if recovered_url:
+                return recovered_url, f"web-search:{method}", evidence or candidate.get("evidence", "") or query, candidate_url
+    return "", "", "", ""
+
+
 def try_shortlink(
     seller_url: str,
     timeout: float,
@@ -246,25 +309,37 @@ def rediscover_row(
     alternate_countries: list[str],
     js_fallback: bool = False,
     hard_timeout_seconds: float | None = None,
+    web_search_fallback: bool = False,
+    web_search_results: int = 6,
+    search_endpoint: str = "https://html.duckduckgo.com/html/",
+    skip_alternate_countries: bool = False,
 ) -> RediscoveryResult:
+    app_store_url = row.get("app_store_url", "") or row.get("live_app_store_url", "")
+    seller_url = row.get("seller_url", "") or row.get("live_seller_url", "")
     result = RediscoveryResult(
         app_id=row.get("app_id", ""),
         country=row.get("country", ""),
         app_name=row.get("app_name", ""),
-        old_root_url=row.get("root_url", ""),
+        old_root_url=row.get("root_url", "") or row.get("old_root_url", ""),
+        app_store_url=app_store_url,
+        seller_url=seller_url,
     )
     try:
-        lookup_fn = lambda: lookup_app(result.app_id, result.country, timeout, user_agent, proxy)
-        lookup, lookup_err = timed_call(lookup_fn, hard_timeout_seconds, {}) if hard_timeout_seconds else (lookup_fn(), None)
-        if not lookup:
+        lookup: dict = {}
+        if not result.app_store_url:
+            lookup_fn = lambda: lookup_app(result.app_id, result.country, timeout, user_agent, proxy)
+            lookup, lookup_err = timed_call(lookup_fn, hard_timeout_seconds, {}) if hard_timeout_seconds else (lookup_fn(), None)
+        else:
+            lookup_err = None
+        if not lookup and not result.app_store_url:
             result.status = "lookup_missing"
             result.error = "iTunes lookup returned no result" if lookup_err is None else f"{type(lookup_err).__name__}: {lookup_err}"
             return result
-        result.app_store_url = lookup.get("trackViewUrl") or ""
-        result.seller_url = lookup.get("sellerUrl") or ""
+        result.app_store_url = result.app_store_url or lookup.get("trackViewUrl") or ""
+        result.seller_url = result.seller_url or lookup.get("sellerUrl") or ""
 
         attempts = [
-            ("app-store", lambda: try_extract_from_app_store(result.app_store_url, timeout, user_agent, proxy)[:3]),
+            ("app-store", lambda: try_extract_from_app_store(result.app_store_url, timeout, user_agent, proxy, js_fallback)[:3]),
             (
                 "seller-base",
                 lambda: discover_from_base_url(
@@ -286,30 +361,37 @@ def rediscover_row(
                 result.status = "recovered"
                 return result
 
-        for alternate_country in alternate_countries:
-            if alternate_country == result.country:
-                continue
-            alternate_lookup_fn = lambda: lookup_app(result.app_id, alternate_country, timeout, user_agent, proxy)
-            alternate_lookup, _alt_err = timed_call(alternate_lookup_fn, hard_timeout_seconds, {}) if hard_timeout_seconds else (alternate_lookup_fn(), None)
-            alternate_app_store_url = alternate_lookup.get("trackViewUrl") or ""
-            recovered_url, method, evidence, external_base = try_extract_from_app_store(
-                alternate_app_store_url,
+        if web_search_fallback:
+            recovered_url, method, evidence, external_base = try_web_search_fallback(
+                result.app_id,
+                result.app_name or lookup.get("trackName", ""),
+                result.country,
                 timeout,
                 user_agent,
                 proxy,
+                max_common_paths,
+                web_search_results,
+                js_fallback,
+                search_endpoint,
             )
             if recovered_url:
                 result.recovered_policy_url = recovered_url
-                result.recovery_method = f"alternate-country:{alternate_country}:{method}"
+                result.recovery_method = method
                 result.evidence = evidence
                 result.status = "recovered"
                 if not result.seller_url:
-                    result.seller_url = alternate_lookup.get("sellerUrl") or ""
+                    result.seller_url = external_base
                 return result
-            if not result.seller_url:
-                result.seller_url = alternate_lookup.get("sellerUrl") or external_base or ""
-                recovered_url, method, evidence = try_extract_from_seller_home(
-                    result.seller_url,
+
+        if not skip_alternate_countries:
+            for alternate_country in alternate_countries:
+                if alternate_country == result.country:
+                    continue
+                alternate_lookup_fn = lambda: lookup_app(result.app_id, alternate_country, timeout, user_agent, proxy)
+                alternate_lookup, _alt_err = timed_call(alternate_lookup_fn, hard_timeout_seconds, {}) if hard_timeout_seconds else (alternate_lookup_fn(), None)
+                alternate_app_store_url = alternate_lookup.get("trackViewUrl") or ""
+                recovered_url, method, evidence, external_base = try_extract_from_app_store(
+                    alternate_app_store_url,
                     timeout,
                     user_agent,
                     proxy,
@@ -320,7 +402,24 @@ def rediscover_row(
                     result.recovery_method = f"alternate-country:{alternate_country}:{method}"
                     result.evidence = evidence
                     result.status = "recovered"
+                    if not result.seller_url:
+                        result.seller_url = alternate_lookup.get("sellerUrl") or ""
                     return result
+                if not result.seller_url:
+                    result.seller_url = alternate_lookup.get("sellerUrl") or external_base or ""
+                    recovered_url, method, evidence = try_extract_from_seller_home(
+                        result.seller_url,
+                        timeout,
+                        user_agent,
+                        proxy,
+                        js_fallback,
+                    )
+                    if recovered_url:
+                        result.recovered_policy_url = recovered_url
+                        result.recovery_method = f"alternate-country:{alternate_country}:{method}"
+                        result.evidence = evidence
+                        result.status = "recovered"
+                        return result
 
         recovered_url, method, evidence = try_common_paths(
             result.seller_url,
@@ -349,12 +448,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample-index", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--output-name", default="apple-platform-policy-rediscovery", help="Base name for output CSV and summary JSON files.")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--sleep", type=float, default=0.15)
     parser.add_argument("--proxy", default=None)
     parser.add_argument("--max-common-paths", type=int, default=18)
     parser.add_argument("--workers", type=int, default=1, help="Concurrent rediscovery workers.")
+    parser.add_argument("--all-rows", action="store_true", help="Process all sample rows instead of only rows whose root_url is an Apple platform URL.")
+    parser.add_argument("--failure-class-filter", default="", help="Comma-separated failure_class values to keep from an already classified CSV.")
+    parser.add_argument("--web-search-fallback", action="store_true", help="Use web search as a last-resort candidate source for rows with no seller URL or App Store external link.")
+    parser.add_argument("--web-search-results", type=int, default=6, help="Maximum web search result URLs to inspect per query.")
+    parser.add_argument("--search-endpoint", default="https://html.duckduckgo.com/html/", help="HTML search endpoint accepting a q query parameter.")
     parser.add_argument("--js-fallback", action="store_true", help="Use browser rendering when seller homepage static discovery finds no policy link.")
     parser.add_argument("--hard-timeout", type=float, default=0, help="Optional per-row wall-clock timeout in seconds for lookup and discovery.")
     parser.add_argument("--resume", action="store_true", help="Skip rows already present in the rediscovery CSV.")
@@ -368,6 +473,7 @@ def main() -> int:
         default="us,gb,ca,au,de,fr,jp,kr,cn",
         help="Comma-separated App Store countries to try after the row country fails.",
     )
+    parser.add_argument("--skip-alternate-countries", action="store_true", help="Skip cross-country lookup fallback; useful for already classified no-sellerUrl repair batches.")
     parser.add_argument(
         "--user-agent",
         default=(
@@ -380,11 +486,15 @@ def main() -> int:
     retry_statuses = {status.strip() for status in args.retry_status.split(",") if status.strip()}
 
     rows = read_rows(args.sample_index)
-    apple_rows = [row for row in rows if is_apple_platform_url(row.get("root_url", ""))]
+    failure_classes = {item.strip() for item in args.failure_class_filter.split(",") if item.strip()}
+    input_rows = rows
+    if failure_classes:
+        input_rows = [row for row in input_rows if row.get("failure_class", "") in failure_classes]
+    apple_rows = input_rows if args.all_rows else [row for row in input_rows if is_apple_platform_url(row.get("root_url", ""))]
     if args.limit:
         apple_rows = apple_rows[: args.limit]
 
-    apple_row_path = args.output_dir / "apple-platform-policy-rows.csv"
+    apple_row_path = args.output_dir / f"{args.output_name}-rows.csv"
     write_csv(apple_row_path, apple_rows, list(rows[0].keys()) if rows else [])
 
     result_fields = [
@@ -400,7 +510,7 @@ def main() -> int:
         "error",
         "evidence",
     ]
-    result_path = args.output_dir / "apple-platform-policy-rediscovery.csv"
+    result_path = args.output_dir / f"{args.output_name}.csv"
     result_rows: list[dict[str, str]] = []
     completed: set[tuple[str, str]] = set()
     if args.resume and result_path.exists():
@@ -435,6 +545,10 @@ def main() -> int:
                     alternate_countries,
                     args.js_fallback,
                     None,
+                    args.web_search_fallback,
+                    args.web_search_results,
+                    args.search_endpoint,
+                    args.skip_alternate_countries,
                 ).__dict__
 
             rediscovered_row, err = timed_call(do_row, args.hard_timeout, None)
@@ -462,6 +576,10 @@ def main() -> int:
             alternate_countries,
             args.js_fallback,
             None,
+            args.web_search_fallback,
+            args.web_search_results,
+            args.search_endpoint,
+            args.skip_alternate_countries,
         )
         return rediscovered.__dict__
 
@@ -495,7 +613,11 @@ def main() -> int:
             method_counts[row["recovery_method"]] = method_counts.get(row["recovery_method"], 0) + 1
     summary = {
         "input_rows": len(rows),
-        "apple_platform_rows": len(apple_rows),
+        "target_rows": len(apple_rows),
+        "apple_platform_rows": sum(1 for row in apple_rows if is_apple_platform_url(row.get("root_url", ""))),
+        "failure_class_filter": sorted(failure_classes),
+        "web_search_fallback": bool(args.web_search_fallback),
+        "skip_alternate_countries": bool(args.skip_alternate_countries),
         "processed_rows": len(result_rows),
         "recovered_rows": status_counts.get("recovered", 0),
         "unique_recovered_apps": len({row["app_id"] for row in result_rows if row["status"] == "recovered"}),
@@ -504,7 +626,7 @@ def main() -> int:
         "apple_rows_csv": str(apple_row_path),
         "rediscovery_csv": str(result_path),
     }
-    summary_path = args.output_dir / "apple-platform-policy-rediscovery-summary.json"
+    summary_path = args.output_dir / f"{args.output_name}-summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

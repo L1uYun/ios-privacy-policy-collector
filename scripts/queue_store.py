@@ -37,12 +37,26 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("pragma foreign_keys = on")
-    conn.execute("pragma busy_timeout = 5000")
+    conn.execute("pragma busy_timeout = 30000")
+    return conn
+
+
+def connect_readonly(db_path: str | Path) -> sqlite3.Connection:
+    path = Path(db_path)
+    if not path.exists():
+        init_db(path)
+        return connect(path)
+    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("pragma foreign_keys = on")
+    conn.execute("pragma busy_timeout = 30000")
     return conn
 
 
 def init_db(db_path: str | Path) -> None:
     with closing(connect(db_path)) as conn:
+        conn.execute("pragma journal_mode = wal")
         conn.executescript(
             """
             create table if not exists schema_meta (
@@ -307,8 +321,72 @@ def import_seeds(db_path: str | Path, rows: Iterable[dict]) -> dict[str, int]:
     return {"inserted": inserted, "duplicates": duplicates}
 
 
-def claim_next_fetch(db_path: str | Path, worker_id: str) -> dict | None:
-    init_db(db_path)
+def claim_next_fetch(
+    db_path: str | Path,
+    worker_id: str,
+    active_only: bool = False,
+    countries: list[str] | None = None,
+    sources: list[str] | None = None,
+    claim_order: str = "oldest",
+) -> dict | None:
+    now = utc_now()
+    clauses = ["f.status = 'pending'", "(f.next_attempt_at is null or f.next_attempt_at <= ?)"]
+    params: list[object] = [now]
+    join_validation = ""
+    if active_only:
+        join_validation = "join seed_validation v on v.seed_id = f.seed_id and v.status = 'active'"
+    if countries:
+        placeholders = ",".join("?" for _country in countries)
+        clauses.append(f"f.country in ({placeholders})")
+        params.extend(country.lower() for country in countries)
+    if sources:
+        source_clauses = []
+        for source in sources:
+            if source.endswith("*"):
+                source_clauses.append("s.seed_source like ?")
+                params.append(source[:-1] + "%")
+            else:
+                source_clauses.append("s.seed_source = ?")
+                params.append(source)
+        clauses.append("(" + " or ".join(source_clauses) + ")")
+    order_sql = "f.fetch_id desc" if claim_order == "newest" else "f.fetch_id"
+    with closing(connect(db_path)) as conn:
+        conn.execute("begin immediate")
+        row = conn.execute(
+            f"""
+            select f.fetch_id, f.seed_id, f.app_id, f.country, f.attempts,
+                   s.bundle_id, s.app_store_url, s.seed_source
+            from policy_fetch f
+            join app_seed s on s.seed_id = f.seed_id
+            {join_validation}
+            where {' and '.join(clauses)}
+            order by {order_sql}
+            limit 1
+            """,
+            params,
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        conn.execute(
+            """
+            update policy_fetch
+            set status = 'running',
+                worker_id = ?,
+                locked_at = ?,
+                attempts = attempts + 1,
+                updated_at = ?
+            where fetch_id = ?
+            """,
+            (worker_id, now, now, row["fetch_id"]),
+        )
+        conn.commit()
+        claimed = dict(row)
+        claimed["attempts"] = int(row["attempts"]) + 1
+        return claimed
+
+
+def claim_fetch_by_id(db_path: str | Path, fetch_id: int, worker_id: str) -> dict | None:
     now = utc_now()
     with closing(connect(db_path)) as conn:
         conn.execute("begin immediate")
@@ -318,12 +396,11 @@ def claim_next_fetch(db_path: str | Path, worker_id: str) -> dict | None:
                    s.bundle_id, s.app_store_url, s.seed_source
             from policy_fetch f
             join app_seed s on s.seed_id = f.seed_id
-            where f.status = 'pending'
+            where f.fetch_id = ?
+              and f.status = 'pending'
               and (f.next_attempt_at is null or f.next_attempt_at <= ?)
-            order by f.fetch_id
-            limit 1
             """,
-            (now,),
+            (fetch_id, now),
         ).fetchone()
         if row is None:
             conn.commit()
@@ -460,9 +537,60 @@ def fail_fetch(
         conn.commit()
 
 
-def stats(db_path: str | Path) -> dict[str, int]:
+def requeue_running_fetches(
+    db_path: str | Path,
+    worker_prefix: str | None = None,
+    locked_before: str | None = None,
+) -> dict[str, int]:
     init_db(db_path)
+    clauses = ["status = 'running'"]
+    params: list[object] = []
+    if worker_prefix:
+        clauses.append("worker_id like ?")
+        params.append(f"{worker_prefix}%")
+    if locked_before:
+        clauses.append("locked_at < ?")
+        params.append(locked_before)
+    now = utc_now()
     with closing(connect(db_path)) as conn:
+        cursor = conn.execute(
+            f"""
+            update policy_fetch
+            set status = 'pending',
+                worker_id = null,
+                locked_at = null,
+                next_attempt_at = ?,
+                updated_at = ?
+            where {' and '.join(clauses)}
+            """,
+            [now, now, *params],
+        )
+        conn.commit()
+        return {"requeued": int(cursor.rowcount or 0)}
+
+
+def requeue_fetch(db_path: str | Path, fetch_id: int) -> dict[str, int]:
+    now = utc_now()
+    with closing(connect(db_path)) as conn:
+        cursor = conn.execute(
+            """
+            update policy_fetch
+            set status = 'pending',
+                worker_id = null,
+                locked_at = null,
+                next_attempt_at = ?,
+                updated_at = ?
+            where fetch_id = ?
+              and status in ('permanent_error', 'failed', 'running')
+            """,
+            (now, now, fetch_id),
+        )
+        conn.commit()
+        return {"requeued": int(cursor.rowcount or 0), "fetch_id": int(fetch_id)}
+
+
+def stats(db_path: str | Path) -> dict[str, int]:
+    with closing(connect_readonly(db_path)) as conn:
         values = {
             "seed_rows": conn.execute("select count(*) from app_seed").fetchone()[0],
             "seed_validations": conn.execute("select count(*) from seed_validation").fetchone()[0],
@@ -519,6 +647,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stats")
     claim_parser = sub.add_parser("claim")
     claim_parser.add_argument("--worker-id", default="manual")
+    claim_parser.add_argument("--active-only", action="store_true")
+    claim_parser.add_argument("--countries", default=None)
+    claim_parser.add_argument("--sources", default=None)
+    claim_parser.add_argument("--claim-order", choices=["oldest", "newest"], default="oldest")
+    requeue_parser = sub.add_parser("requeue-running")
+    requeue_parser.add_argument("--worker-prefix", default=None)
+    requeue_parser.add_argument("--locked-before", default=None)
+    requeue_fetch_parser = sub.add_parser("requeue-fetch")
+    requeue_fetch_parser.add_argument("--fetch-id", type=int, required=True)
     return parser
 
 
@@ -536,7 +673,26 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(stats(args.db), sort_keys=True))
         return 0
     if args.command == "claim":
-        print(json.dumps(claim_next_fetch(args.db, args.worker_id), sort_keys=True))
+        countries = [item.strip().lower() for item in args.countries.split(",") if item.strip()] if args.countries else None
+        sources = [item.strip() for item in args.sources.split(",") if item.strip()] if args.sources else None
+        print(json.dumps(
+            claim_next_fetch(
+                args.db,
+                args.worker_id,
+                active_only=args.active_only,
+                countries=countries,
+                sources=sources,
+                claim_order=args.claim_order,
+            ),
+            sort_keys=True,
+        ))
+        return 0
+    if args.command == "requeue-running":
+        print(json.dumps(requeue_running_fetches(args.db, args.worker_prefix, args.locked_before), sort_keys=True))
+        return 0
+    if args.command == "requeue-fetch":
+        print(json.dumps(requeue_fetch(args.db, args.fetch_id), sort_keys=True))
+        return 0
         return 0
     raise AssertionError(args.command)
 

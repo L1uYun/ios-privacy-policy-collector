@@ -14,6 +14,11 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, Iterator
 
+try:
+    import requests
+except ImportError:  # pragma: no cover - exercised in lean remote venvs.
+    requests = None
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -35,10 +40,12 @@ def request_json(url: str, timeout: int, user_agent: str, proxy: str | None) -> 
 
 def request_text(url: str, timeout: int, user_agent: str, proxy: str | None, backend: str = "urllib") -> str:
     if backend == "requests":
-        import requests
-
+        if requests is None:
+            return request_text(url, timeout=timeout, user_agent=user_agent, proxy=proxy, backend="urllib")
         proxies = {"http": proxy, "https": proxy} if proxy else None
-        response = requests.get(
+        session = requests.Session()
+        session.trust_env = False
+        response = session.get(
             url,
             headers={
                 "User-Agent": user_agent,
@@ -92,10 +99,13 @@ def cdx_query_url(
 
 def iter_cdx_json_lines(url: str, timeout: int, user_agent: str, proxy: str | None, backend: str = "urllib") -> Iterator[dict]:
     if backend == "requests":
-        import requests
-
+        if requests is None:
+            yield from iter_cdx_json_lines(url, timeout=timeout, user_agent=user_agent, proxy=proxy, backend="urllib")
+            return
         proxies = {"http": proxy, "https": proxy} if proxy else None
-        response = requests.get(
+        session = requests.Session()
+        session.trust_env = False
+        response = session.get(
             url,
             headers={
                 "User-Agent": user_agent,

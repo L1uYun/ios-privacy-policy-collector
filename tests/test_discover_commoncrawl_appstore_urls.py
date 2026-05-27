@@ -2,6 +2,7 @@ import importlib.util
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -85,6 +86,20 @@ class DiscoverCommonCrawlAppStoreUrlsTests(unittest.TestCase):
         args = self.discovery.build_parser().parse_args([])
 
         self.assertEqual(args.backend, "requests")
+
+    def test_requests_backend_does_not_inherit_environment_proxy(self):
+        fake_response = mock.Mock()
+        fake_response.status_code = 200
+        fake_response.text = "[]"
+        fake_session = mock.Mock()
+        fake_session.get.return_value = fake_response
+
+        with mock.patch.object(self.discovery.requests, "Session", return_value=fake_session):
+            text = self.discovery.request_text("https://index.commoncrawl.org/collinfo.json", 10, "agent", None, backend="requests")
+
+        self.assertEqual(text, "[]")
+        self.assertFalse(fake_session.trust_env)
+        self.assertIsNone(fake_session.get.call_args.kwargs["proxies"])
 
 
 if __name__ == "__main__":

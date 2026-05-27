@@ -37,6 +37,8 @@ def build_worker_command(args: argparse.Namespace, worker_index: int, limit: int
         worker_id,
         "--limit",
         str(limit),
+        "--min-policy-chars",
+        str(args.min_policy_chars),
         "--output-dir",
         args.output_dir,
         "--jsonl",
@@ -60,6 +62,14 @@ def build_worker_command(args: argparse.Namespace, worker_index: int, limit: int
     ]
     if args.proxy:
         command.extend(["--proxy", args.proxy])
+    if args.active_only:
+        command.append("--active-only")
+    if args.countries:
+        command.extend(["--countries", args.countries])
+    if args.sources:
+        command.extend(["--sources", args.sources])
+    if args.claim_order:
+        command.extend(["--claim-order", args.claim_order])
     if args.try_common_paths:
         command.append("--try-common-paths")
     if args.enrich_lookup:
@@ -74,7 +84,6 @@ def build_worker_command(args: argparse.Namespace, worker_index: int, limit: int
 
 
 def summarize(db_path: str | Path) -> dict:
-    queue_store.init_db(db_path)
     stats = queue_store.stats(db_path)
     with queue_store.connect(db_path) as conn:
         root_methods = {
@@ -124,10 +133,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--limit-per-worker", type=int, default=250)
     parser.add_argument("--worker-prefix", default="batch")
+    parser.add_argument("--active-only", action="store_true", help="Claim only seeds validated as active by iTunes lookup.")
+    parser.add_argument("--countries", default=None, help="Comma-separated storefront countries to claim.")
+    parser.add_argument("--sources", default=None, help="Comma-separated seed sources to claim. A trailing * means prefix match.")
+    parser.add_argument("--claim-order", choices=["oldest", "newest"], default="oldest")
     parser.add_argument("--proxy", default=None)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--fallback-timeout", type=int, default=6)
     parser.add_argument("--max-attempts", type=int, default=1)
+    parser.add_argument("--min-policy-chars", type=int, default=1000)
     parser.add_argument("--try-common-paths", action="store_true", default=True)
     parser.add_argument("--enrich-lookup", action="store_true", default=True)
     parser.add_argument("--collect-cluster", action="store_true", default=True)

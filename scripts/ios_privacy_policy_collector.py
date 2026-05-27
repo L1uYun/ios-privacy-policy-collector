@@ -58,6 +58,22 @@ NUMERIC_ID_RE = re.compile(r"^\d{5,}$")
 ID_PREFIX_RE = re.compile(r"^id(?P<id>\d{5,})$")
 TEXT_URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+", re.IGNORECASE)
 PRIVACY_CONTEXT_RE = re.compile(r"privacy(?:\s+policy)?", re.IGNORECASE)
+SEARCH_RESULT_NOISE_HOSTS = {
+    "bing.com",
+    "duckduckgo.com",
+    "google.com",
+    "apps.apple.com",
+    "itunes.apple.com",
+    "apple.com",
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "play.google.com",
+    "support.apple.com",
+    "twitter.com",
+    "x.com",
+    "youtube.com",
+}
 SHORTLINK_HOSTS = {
     "bit.ly",
     "buff.ly",
@@ -902,6 +918,68 @@ def origin_from_url(url: str) -> str:
 def is_shortlink_url(url: str) -> bool:
     host = (urllib.parse.urlparse(url or "").hostname or "").lower()
     return host in SHORTLINK_HOSTS
+
+
+def is_search_result_noise_url(url: str) -> bool:
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    if not host:
+        return True
+    if is_apple_platform_policy_url(url):
+        return True
+    return any(host == noise or host.endswith("." + noise) for noise in SEARCH_RESULT_NOISE_HOSTS)
+
+
+def web_search_url_candidates(
+    query: str,
+    timeout: int,
+    user_agent: str,
+    proxy: str | None = None,
+    limit: int = 6,
+    endpoint: str = "https://html.duckduckgo.com/html/",
+) -> list[dict]:
+    if not query.strip():
+        return []
+    payload = urllib.parse.urlencode({"q": query})
+    search_url = endpoint + ("&" if "?" in endpoint else "?") + payload
+    html_text = request_text(search_url, timeout, user_agent, proxy=proxy, retries=0)
+    parser = LinkExtractor()
+    parser.feed(html_text)
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    scored: list[tuple[int, str, dict[str, str]]] = []
+    for link in parser.links:
+        href = normalize_url(link.get("href", ""), search_url)
+        parsed = urllib.parse.urlparse(href)
+        if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
+            query_params = urllib.parse.parse_qs(parsed.query)
+            if query_params.get("uddg"):
+                href = urllib.parse.unquote(query_params["uddg"][0])
+        if href in seen or is_search_result_noise_url(href):
+            continue
+        seen.add(href)
+        haystack = f"{link.get('text', '')} {href}".lower()
+        score = privacy_candidate_score_url(href)
+        if "privacy" in haystack:
+            score += 60
+        if "policy" in haystack:
+            score += 20
+        if "official" in haystack or "developer" in haystack:
+            score += 10
+        if urllib.parse.urlparse(href).scheme not in {"http", "https"}:
+            continue
+        scored.append((score, href, link))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    for score, href, link in scored[:limit]:
+        candidates.append(
+            {
+                "url": href,
+                "source": "web-search",
+                "browser_first": False,
+                "evidence": (link.get("text") or href).strip(),
+                "score": str(score),
+            }
+        )
+    return candidates
 
 
 def expand_shortlink_candidate(

@@ -156,6 +156,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=str(queue_store.default_db_path()))
     parser.add_argument("--worker-id", default=f"worker-{uuid.uuid4().hex[:8]}")
     parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument("--fetch-id", type=int, default=None, help="Claim one specific pending fetch ID for targeted retry.")
+    parser.add_argument("--active-only", action="store_true", help="Claim only seeds validated as active by iTunes lookup.")
+    parser.add_argument("--countries", default=None, help="Comma-separated storefront countries to claim.")
+    parser.add_argument("--sources", default=None, help="Comma-separated seed sources to claim. A trailing * means prefix match.")
+    parser.add_argument("--claim-order", choices=["oldest", "newest"], default="oldest")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--output-dir", default=str(queue_store.default_data_root() / "out"))
     parser.add_argument("--jsonl", default=str(queue_store.default_data_root() / "worker-results.jsonl"))
@@ -183,10 +188,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    queue_store.init_db(args.db)
     processed = 0
+    countries = [item.strip().lower() for item in args.countries.split(",") if item.strip()] if args.countries else None
+    sources = [item.strip() for item in args.sources.split(",") if item.strip()] if args.sources else None
     while processed < args.limit:
-        task = queue_store.claim_next_fetch(args.db, args.worker_id)
+        if args.fetch_id is not None:
+            if processed > 0:
+                break
+            task = queue_store.claim_fetch_by_id(args.db, args.fetch_id, args.worker_id)
+        else:
+            task = queue_store.claim_next_fetch(
+                args.db,
+                args.worker_id,
+                active_only=args.active_only,
+                countries=countries,
+                sources=sources,
+                claim_order=args.claim_order,
+            )
         if task is None:
             break
         try:

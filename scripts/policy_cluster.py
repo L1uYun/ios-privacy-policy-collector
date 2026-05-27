@@ -234,6 +234,12 @@ def archive_node(
     text = collector.html_to_text(html_text)
     markdown, method, links = collector.best_markdown_and_links(html_text, url)
     quality, quality_reason = collector.policy_text_quality(text, min_chars)
+    fallback_markdown, fallback_method, fallback_links = collector.ensure_markdown_complete(markdown, text, url, min_chars)
+    if fallback_method:
+        markdown = fallback_markdown
+        method = fallback_method
+        links = fallback_links + links
+    links = collector.ensure_source_link(links, url)
     if require_quality and quality == "too_short":
         raise QualityError(quality_reason or f"extracted text for {url} is too short")
     stem = safe_filename(url, index)

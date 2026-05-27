@@ -391,6 +391,36 @@ class IosPrivacyPolicyCollectorTests(unittest.TestCase):
         self.assertEqual(candidates[0]["source"], "app-store-external-link")
         self.assertEqual(candidates[1]["url"], "https://support.example.com/app")
 
+    def test_web_search_url_candidates_filter_noise_and_rank_privacy(self):
+        html = """
+        <html><body>
+          <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fapps.apple.com%2Fus%2Fapp%2Fexample%2Fid123">App Store</a>
+          <a class="result__a" href="https://html.duckduckgo.com/privacy">DuckDuckGo Privacy</a>
+          <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fdeveloper.example.com%2F">Example Developer</a>
+          <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fdeveloper.example.com%2Fprivacy-policy">Example App Privacy Policy</a>
+        </body></html>
+        """
+
+        def fake_request_text(url, timeout, user_agent, proxy=None, retries=0):
+            self.assertIn("Example+App+privacy", url)
+            return html
+
+        original_request_text = self.collector.request_text
+        try:
+            self.collector.request_text = fake_request_text
+            candidates = self.collector.web_search_url_candidates(
+                "Example App privacy",
+                10,
+                "agent",
+            )
+        finally:
+            self.collector.request_text = original_request_text
+
+        self.assertEqual(candidates[0]["url"], "https://developer.example.com/privacy-policy")
+        self.assertEqual(candidates[0]["source"], "web-search")
+        self.assertNotIn("apps.apple.com", {candidate["url"] for candidate in candidates})
+        self.assertNotIn("duckduckgo.com", {self.collector.urllib.parse.urlparse(candidate["url"]).hostname for candidate in candidates})
+
     def test_seller_home_policy_candidates_can_use_js_rendering(self):
         def fake_request_text(url, timeout, user_agent, proxy=None):
             return "<html><body><div id='app'>Loading</div></body></html>"

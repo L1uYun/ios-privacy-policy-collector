@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import pathlib
 import sys
+import tempfile
 import unittest
 
 
@@ -36,6 +38,46 @@ class DiscoverCommonCrawlSlugPrefixesTests(unittest.TestCase):
         self.assertIn("0", prefixes)
         self.assertIn("a", prefixes)
         self.assertIn("z", prefixes)
+
+    def test_generate_prefixes_from_alphabet_and_lengths(self):
+        prefixes = self.slug.generate_prefixes("ab", "1,2")
+
+        self.assertEqual(prefixes, ["a", "b", "aa", "ab", "ba", "bb"])
+
+    def test_load_completed_progress_tasks_only_ok_shards(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = pathlib.Path(tmpdir) / "progress.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"country": "us", "prefix": "ab", "status": "ok"}),
+                        json.dumps({"country": "jp", "prefix": "cd", "status": "error"}),
+                        "not-json",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            completed = self.slug.load_completed_progress_shards(path)
+
+        self.assertEqual(completed, {("us", "ab")})
+
+    def test_progress_completion_keeps_later_success_after_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = pathlib.Path(tmpdir) / "progress.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"country": "us", "prefix": "st", "status": "error"}),
+                        json.dumps({"country": "us", "prefix": "st", "status": "ok"}),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            completed = self.slug.load_completed_progress_shards(path)
+
+        self.assertEqual(completed, {("us", "st")})
 
 
 if __name__ == "__main__":

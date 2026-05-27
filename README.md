@@ -784,19 +784,40 @@ F:\ios-privacy-policy-collector-10k\apple-platform-policy-rediscovery.csv
 F:\ios-privacy-policy-collector-10k\apple-platform-policy-rediscovery-final-audited-summary.json
 F:\ios-privacy-policy-collector-10k\apple-platform-policy-rediscovery-final-nonrecovered-classified.csv
 F:\ios-privacy-policy-collector-10k\apple-platform-policy-rediscovery-apple-rejected.csv
+F:\ios-privacy-policy-collector-10k\clean\apple-platform-policy-rediscovery-clean.csv
 ```
 
 Final audited subset status:
 
 ```text
 Apple-platform subset rows: 8074
-Developer policy recovered: 7873
+Developer policy recovered: 7874
 Apple/platform rejected: 97
-Network/error tail: 78
+Network/error tail: 77
 Unrecovered: 25
 iTunes lookup missing: 1
-Developer-policy recovery rate in this subset: 97.511%
+Developer-policy recovery rate in this subset: 97.523%
+Unique recovered apps: 5094
+Unique recovered policy URLs: 4718
 ```
+
+The `clean/` directory contains the reviewer-facing CSVs generated from the
+working audit file:
+
+- `apple-platform-policy-rediscovery-clean.csv`: all rows with normalized
+  `audit_class`, `confidence`, `source_type`, `policy_url`, and
+  `policy_domain` columns.
+- `apple-platform-policy-rediscovery-recovered-clean.csv`: recovered developer
+  policy rows only.
+- `apple-platform-policy-rediscovery-nonrecovered-clean.csv`: rejected,
+  unrecovered, error, and lookup-missing rows only.
+- `apple-platform-policy-rediscovery-clean-summary.json`: machine-readable
+  status, audit-class, confidence, and source-type counts.
+
+The 2026-05-27 clean pass also merged one manually verified recovery:
+WeatherRadar Basic (`app_id=1187807450`, `country=nz`) now maps to
+`https://www.sparklingapps.com/mobile/privacy.html` with
+`recovery_method=manual-audit:web-search:developer-site`.
 
 Important interpretation: `apple_platform_rejected` rows are not successful
 developer-policy recoveries. They are rows where discovery attempted to use an
@@ -806,12 +827,14 @@ metrics or label them separately as Apple/platform policy rows.
 
 The tail file
 `apple-platform-policy-rediscovery-final-nonrecovered-classified.csv`
-classifies the 201 non-recovered rows into:
+classifies the previously audited non-recovered rows. After the WeatherRadar
+manual merge, the current clean non-recovered count is 200:
 
 - `apple_platform_or_first_party`: 97 rows, exclude or label separately.
-- `network_timeout_retryable`: 78 rows, retry later with lower concurrency and
+- `network_timeout_retryable`: 74 rows in the clean audit class, retry later
+  with lower concurrency and
   direct/proxy A-B testing.
-- `no_seller_url_no_external_link`: 19 rows, requires web search or Common
+- `no_seller_url_no_external_link`: remaining rows require web search or Common
   Crawl by app name plus app ID because App Store metadata did not expose a
   deterministic developer URL.
 - `seller_site_no_policy_found`: 4 rows, add domain rules or mark no visible
@@ -850,6 +873,41 @@ Suggested code sync from Windows, after committing the local changes:
 git push origin master
 ssh t430 "cd /data/xiaolab-research/ios-privacy-policy-collector && git pull --ff-only"
 ```
+
+For the remaining `no_seller_url_no_external_link` rows, use the classified
+tail CSV directly and enable the App Store external-link plus web-search
+fallback path:
+
+```powershell
+python scripts\rediscover_apple_platform_policies.py `
+  --sample-index F:\ios-privacy-policy-collector-10k\apple-platform-policy-rediscovery-tail-104-classified.csv `
+  --output-dir F:\ios-privacy-policy-collector-10k `
+  --output-name apple-platform-policy-rediscovery-no-seller-websearch `
+  --all-rows `
+  --failure-class-filter no_seller_url_no_external_link `
+  --timeout 8 `
+  --hard-timeout 30 `
+  --proxy http://127.0.0.1:7890 `
+  --workers 1 `
+  --sleep 0 `
+  --web-search-fallback `
+  --web-search-results 3 `
+  --skip-alternate-countries
+```
+
+The `--skip-alternate-countries` flag is intentional for this repair class:
+the classified CSV already carries `live_app_store_url`, so the repair should
+try that App Store page's external links, then web search by app name and app
+ID, before any expensive cross-country lookup. Search results are only treated
+as candidates; the collector still probes privacy/common paths and rejects
+Apple, App Store, DuckDuckGo, Google, Bing, and other platform/noise hosts.
+
+Pilot checks on 2026-05-26 found that a naive search fallback can otherwise
+misclassify the search engine's own `/privacy` page as a recovered policy. That
+case is now filtered and covered by tests. A fixed first-5 pilot recovered
+`0/5` rows, while the earlier unfiltered pilot's apparent `5/5` was rejected as
+false positive. Treat web-search recovery as an audited candidate source, not a
+blind success source.
 
 Next useful failure reducers:
 

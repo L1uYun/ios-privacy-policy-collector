@@ -106,6 +106,65 @@ class QueueStoreTests(unittest.TestCase):
         self.assertIsNone(none_left)
         self.assertEqual(stats["running_fetches"], 2)
 
+    def test_claim_next_fetch_can_prefer_active_validated_seed(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [
+                {"seed_source": "fixture", "app_id": "111", "country": "us"},
+                {"seed_source": "fixture", "app_id": "222", "country": "us"},
+            ],
+        )
+        with closing(self.queue.connect(self.db_path)) as conn:
+            seed_id = conn.execute("select seed_id from app_seed where app_id = '222'").fetchone()["seed_id"]
+            conn.execute(
+                """
+                insert into seed_validation(seed_id, seed_source, app_id, country, status, result_count, validated_at)
+                values (?, 'fixture', '222', 'us', 'active', 1, 'now')
+                """,
+                (seed_id,),
+            )
+            conn.commit()
+
+        task = self.queue.claim_next_fetch(self.db_path, worker_id="w1", active_only=True)
+
+        self.assertEqual(task["app_id"], "222")
+
+    def test_claim_next_fetch_can_filter_countries(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [
+                {"seed_source": "fixture", "app_id": "111", "country": "us"},
+                {"seed_source": "fixture", "app_id": "222", "country": "gb"},
+            ],
+        )
+
+        task = self.queue.claim_next_fetch(self.db_path, worker_id="w1", countries=["gb"])
+
+        self.assertEqual(task["country"], "gb")
+
+    def test_claim_next_fetch_can_filter_sources_and_order_newest(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [
+                {"seed_source": "old-source", "app_id": "111", "country": "us"},
+                {"seed_source": "apple-search:ai", "app_id": "222", "country": "us"},
+                {"seed_source": "apple-search:ai", "app_id": "333", "country": "us"},
+            ],
+        )
+
+        task = self.queue.claim_next_fetch(
+            self.db_path,
+            worker_id="w1",
+            sources=["apple-search:ai"],
+            claim_order="newest",
+        )
+
+        self.assertEqual(task["app_id"], "333")
+        self.assertEqual(task["seed_source"], "apple-search:ai")
+
     def test_complete_fetch_records_policy_document_and_links(self):
         self.queue.init_db(self.db_path)
         self.queue.import_seeds(
@@ -246,6 +305,68 @@ class QueueStoreTests(unittest.TestCase):
 
         self.assertEqual(stats["permanent_error_fetches"], 1)
         self.assertEqual(stats["pending_fetches"], 0)
+
+    def test_requeue_stale_running_fetches_by_worker_prefix(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [{"seed_source": "fixture", "app_id": "123", "country": "us"}],
+        )
+        self.queue.claim_next_fetch(self.db_path, worker_id="batch-old-001")
+
+        result = self.queue.requeue_running_fetches(self.db_path, worker_prefix="batch-old")
+        task = self.queue.claim_next_fetch(self.db_path, worker_id="new")
+
+        self.assertEqual(result["requeued"], 1)
+        self.assertEqual(task["app_id"], "123")
+
+    def test_requeue_fetch_resets_one_permanent_error(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [{"seed_source": "fixture", "app_id": "123", "country": "us"}],
+        )
+        task = self.queue.claim_next_fetch(self.db_path, worker_id="old")
+        self.queue.fail_fetch(
+            self.db_path,
+            fetch_id=task["fetch_id"],
+            error_class="RuntimeError",
+            error_message="policy text not complete enough",
+            retryable=False,
+            max_attempts=1,
+        )
+
+        result = self.queue.requeue_fetch(self.db_path, task["fetch_id"])
+        retried = self.queue.claim_next_fetch(self.db_path, worker_id="new")
+
+        self.assertEqual(result["requeued"], 1)
+        self.assertEqual(retried["fetch_id"], task["fetch_id"])
+        self.assertEqual(retried["app_id"], "123")
+
+    def test_claim_fetch_by_id_claims_only_that_pending_fetch(self):
+        self.queue.init_db(self.db_path)
+        self.queue.import_seeds(
+            self.db_path,
+            [
+                {"seed_source": "fixture", "app_id": "123", "country": "us"},
+                {"seed_source": "fixture", "app_id": "456", "country": "us"},
+            ],
+        )
+        first = self.queue.claim_next_fetch(self.db_path, worker_id="old")
+        self.queue.fail_fetch(
+            self.db_path,
+            fetch_id=first["fetch_id"],
+            error_class="RuntimeError",
+            error_message="policy text not complete enough",
+            retryable=False,
+            max_attempts=1,
+        )
+        self.queue.requeue_fetch(self.db_path, first["fetch_id"])
+
+        claimed = self.queue.claim_fetch_by_id(self.db_path, first["fetch_id"], "targeted")
+
+        self.assertEqual(claimed["fetch_id"], first["fetch_id"])
+        self.assertEqual(claimed["app_id"], "123")
 
 
 if __name__ == "__main__":
