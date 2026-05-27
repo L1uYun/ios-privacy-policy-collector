@@ -108,6 +108,31 @@ def lookup_app(app_id: str, country: str, timeout: float, user_agent: str, proxy
     return results[0] if results else {}
 
 
+def lookup_app_any_country(
+    app_id: str,
+    preferred_country: str,
+    alternate_countries: list[str],
+    timeout: float,
+    user_agent: str,
+    proxy: str | None,
+    hard_timeout_seconds: float | None = None,
+) -> tuple[dict, str]:
+    attempts: list[str] = []
+    if preferred_country:
+        attempts.append(preferred_country)
+    for alternate_country in alternate_countries:
+        if alternate_country and alternate_country not in attempts:
+            attempts.append(alternate_country)
+    for country in attempts:
+        lookup_fn = lambda: lookup_app(app_id, country, timeout, user_agent, proxy)
+        lookup, lookup_err = timed_call(lookup_fn, hard_timeout_seconds, {}) if hard_timeout_seconds else (lookup_fn(), None)
+        if lookup:
+            return lookup, country
+        if lookup_err is not None:
+            continue
+    return {}, ""
+
+
 def try_extract_from_app_store(
     app_store_url: str,
     timeout: float,
@@ -326,14 +351,20 @@ def rediscover_row(
     )
     try:
         lookup: dict = {}
+        lookup_country = result.country
         if not result.app_store_url:
-            lookup_fn = lambda: lookup_app(result.app_id, result.country, timeout, user_agent, proxy)
-            lookup, lookup_err = timed_call(lookup_fn, hard_timeout_seconds, {}) if hard_timeout_seconds else (lookup_fn(), None)
-        else:
-            lookup_err = None
+            lookup, lookup_country = lookup_app_any_country(
+                result.app_id,
+                result.country,
+                alternate_countries,
+                timeout,
+                user_agent,
+                proxy,
+                hard_timeout_seconds,
+            )
         if not lookup and not result.app_store_url:
             result.status = "lookup_missing"
-            result.error = "iTunes lookup returned no result" if lookup_err is None else f"{type(lookup_err).__name__}: {lookup_err}"
+            result.error = "storefront lookup returned no result"
             return result
         result.app_store_url = result.app_store_url or lookup.get("trackViewUrl") or ""
         result.seller_url = result.seller_url or lookup.get("sellerUrl") or ""
@@ -402,6 +433,7 @@ def rediscover_row(
                     result.recovery_method = f"alternate-country:{alternate_country}:{method}"
                     result.evidence = evidence
                     result.status = "recovered"
+                    result.error = ""
                     if not result.seller_url:
                         result.seller_url = alternate_lookup.get("sellerUrl") or ""
                     return result
@@ -419,6 +451,7 @@ def rediscover_row(
                         result.recovery_method = f"alternate-country:{alternate_country}:{method}"
                         result.evidence = evidence
                         result.status = "recovered"
+                        result.error = ""
                         return result
 
         recovered_url, method, evidence = try_common_paths(
@@ -433,6 +466,7 @@ def rediscover_row(
             result.recovery_method = method
             result.evidence = evidence
             result.status = "recovered"
+            result.error = ""
             return result
 
         result.status = "unrecovered"

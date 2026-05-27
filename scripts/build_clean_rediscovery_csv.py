@@ -30,7 +30,7 @@ def _audit_class(row: dict[str, str]) -> str:
     if status == "apple_platform_rejected":
         return "apple_platform_or_first_party_rejected"
     if status == "lookup_missing":
-        return "itunes_lookup_missing_or_app_unavailable"
+        return "storefront_lookup_miss"
     error = row.get("error", "").lower()
     if "timeout" in error or "timed out" in error:
         return "network_timeout_retryable"
